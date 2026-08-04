@@ -25,20 +25,6 @@ jobs:
       - name: Check formatting
         run: zig fmt --check src/
 
-  lint-py:
-    name: Python lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-      - name: Ruff check
-        run: uv run ruff check .
-      - name: Ruff format check
-        run: uv run ruff format --check .
-      - name: Pyright
-        run: uv run pyright
-
   lint-actions:
     name: Lint workflows
     runs-on: ubuntu-latest
@@ -74,20 +60,19 @@ jobs:
             zig-${{ runner.os }}-${{ matrix.zig }}-
             zig-${{ runner.os }}-
       - name: Compile check
-        run: zig build check
+        run: zig build
       - name: Run tests
         run: zig build test
 
-  e2e:
-    name: End-to-end
+  sst:
+    name: Conformance (SingleStepTests)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: "0.16.0"
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
@@ -98,7 +83,8 @@ jobs:
           restore-keys: |
             zig-${{ runner.os }}-0.16.0-
             zig-${{ runner.os }}-
-      - name: Build
-        run: zig build
-      - name: Run end-to-end tests
-        run: uv run pytest test/ -v
+      - name: Fetch test data
+        run: tools/fetch_tests.sh
+      - name: Run conformance suite
+        run: zig build sst
+
