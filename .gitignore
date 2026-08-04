@@ -1,0 +1,9 @@
+.zig-cache/
+zig-out/
+*.o
+.env
+.claude/
+.tokensave
+.serena/
+.venv/
+__pycache__/
