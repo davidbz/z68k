@@ -60,7 +60,7 @@ jobs:
             zig-${{ runner.os }}-${{ matrix.zig }}-
             zig-${{ runner.os }}-
       - name: Compile check
-        run: zig build check
+        run: zig build
       - name: Run tests
         run: zig build test
 

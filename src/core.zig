@@ -132,18 +132,28 @@ pub fn Core(comptime BusT: type) type {
                 .addr_ind => c.a[reg],
                 .addr_postinc => blk: {
                     const addr = c.a[reg];
-                    // Reads increment before the bus cycle, writes after, so a
-                    // misaligned write faults with the register still holding
-                    // its original value.
-                    if (write and size != .byte and addr & 1 != 0) {
-                        break :blk addressError(ctx, addr, false, false);
+                    // Word reads increment before the bus cycle; writes and
+                    // long reads write the register back only after the first
+                    // bus cycle succeeds, so their misaligned faults leave it
+                    // holding its original value. (Empirical, from the
+                    // conformance data; word reads really do differ.)
+                    if (addr & 1 != 0 and size != .byte and (write or size == .long)) {
+                        break :blk addressError(ctx, addr, !write, false);
                     }
                     c.a[reg] +%= stackAdjust(reg, size);
                     break :blk addr;
                 },
                 .addr_predec => blk: {
-                    c.a[reg] -%= stackAdjust(reg, size);
-                    break :blk c.a[reg];
+                    const addr = c.a[reg] -% stackAdjust(reg, size);
+                    // A long write goes low word first, so the first bus cycle
+                    // is at addr+2 and a misaligned fault happens before the
+                    // register writeback. Reads go high word first and fault
+                    // with the register already decremented.
+                    if (write and size == .long and addr & 1 != 0) {
+                        break :blk addressError(ctx, addr +% 2, false, false);
+                    }
+                    c.a[reg] = addr;
+                    break :blk addr;
                 },
                 .addr_disp => blk: {
                     const d: i16 = @bitCast(try fetch16(ctx));
@@ -407,7 +417,7 @@ pub fn Core(comptime BusT: type) type {
                 .moveq => opMoveq(ctx, op),
                 .lea => try opLea(ctx, op),
                 .nop => {},
-                .rts => ctx.cpu.pc = try pop32(ctx),
+                .rts => try jump(ctx, try pop32(ctx)),
                 .bra, .bsr, .bcc => try opBranch(ctx, op, instr),
 
                 .line_a => return Fault.LineA,
@@ -429,18 +439,41 @@ pub fn Core(comptime BusT: type) type {
             const dst_reg: u3 = @truncate(op >> 9);
 
             // Each operand's cost is charged before its bus cycle: an address
-            // error partway through still pays for the work already done.
+            // error partway through still pays for the work already done. A
+            // faulting long operand only got as far as its first word access,
+            // so it pays the word cost, not the long one.
             ctx.cpu.cycles += src_mode.cycles(size);
-            const v = try readEa(ctx, src_mode, src_reg, size);
+            const v = blk: {
+                errdefer if (size == .long) {
+                    ctx.cpu.cycles -= 4;
+                };
+                break :blk try readEa(ctx, src_mode, src_reg, size);
+            };
 
             if (instr.mnemonic == .movea) {
                 // MOVEA sign extends and touches no flags.
                 ctx.cpu.a[dst_reg] = signExtend(v, size);
                 return;
             }
-            ctx.cpu.sr.setNzvc(flags.logic(v, size));
+
+            // Flag latch order matters when the destination write faults:
+            // word moves and the low-word-first predecrement have already
+            // updated CCR, everything else has not. (MAME's microcode order,
+            // checked by the conformance data.)
+            const cc = flags.logic(v, size);
+            const flags_first = size != .long or dst_mode == .addr_predec;
+            if (flags_first) ctx.cpu.sr.setNzvc(cc);
+
             ctx.cpu.cycles += dst_mode.destCycles(size);
-            try writeEa(ctx, dst_mode, dst_reg, size, v);
+            {
+                // Predecrement pays its full cost even when it faults; its
+                // first access is the one the destCycles discount covers.
+                errdefer if (size == .long and dst_mode != .addr_predec) {
+                    ctx.cpu.cycles -= 4;
+                };
+                try writeEa(ctx, dst_mode, dst_reg, size, v);
+            }
+            if (!flags_first) ctx.cpu.sr.setNzvc(cc);
         }
 
         fn opMoveq(ctx: *Ctx, op: u16) void {
@@ -476,6 +509,7 @@ pub fn Core(comptime BusT: type) type {
                 },
                 .bcc => {
                     if (flags.testCondition(c.sr, @truncate(op >> 8))) {
+                        c.cycles += 2; // taken is 10, base covers the not-taken 8
                         try jump(ctx, target);
                     } else {
                         // Not taken costs less; the 16-bit form costs more.

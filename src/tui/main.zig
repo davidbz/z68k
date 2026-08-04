@@ -128,17 +128,12 @@ fn drawMemory(win: vaxis.Window, d: *const Debug, bus: *const FlatBus, fa: std.m
         const base = d.mem_cursor +% row * 16;
         if (base + 16 > bus.ram.len) return;
 
-        const bytes = bus.ram[base..][0..16];
-        const text = std.fmt.allocPrint(
-            fa,
-            "{x:0>6}: {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}" ++
-                " {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}",
-            .{
-                base,      bytes[0],  bytes[1],  bytes[2],  bytes[3],  bytes[4],
-                bytes[5],  bytes[6],  bytes[7],  bytes[8],  bytes[9],  bytes[10],
-                bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-            },
-        ) catch return;
+        var line: [64]u8 = undefined;
+        var used = (std.fmt.bufPrint(&line, "{x:0>6}:", .{base}) catch return).len;
+        for (bus.ram[base..][0..16]) |byte| {
+            used += (std.fmt.bufPrint(line[used..], " {x:0>2}", .{byte}) catch return).len;
+        }
+        const text = fa.dupe(u8, line[0..used]) catch return;
         _ = win.printSegment(.{ .text = text }, .{ .row_offset = row });
     }
 }

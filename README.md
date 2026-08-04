@@ -14,9 +14,11 @@ divergence this causes.
 ## Status
 
 Early development (milestone M1 of 6): decode table, MOVE/MOVEA/MOVEQ, LEA,
-branches, and the exception machinery (address errors, illegal instructions,
-interrupts, trace). Across the 8 applicable conformance files (20,000 cases),
-all failures are the single documented prefetch gap; unexplained failures are 0.
+branches, RTS, and the exception machinery (address errors, illegal
+instructions, interrupts, trace). Across the 13 applicable conformance files
+(32,500 cases), all failures are the single documented prefetch gap;
+unexplained failures are 0, and every state-passing case also passes the
+cycle tier. Files for not-yet-implemented families are skipped and counted.
 
 ## Requirements
 

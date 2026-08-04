@@ -361,10 +361,16 @@ fn writeEa(ctx: *Ctx, mode: EaMode, reg: u3, size: Size, v: u32) Fault!void;
   where the real chip's prefetch becomes architecturally visible; no queue
   needed to get it right). They are also **program-space** accesses, which the
   function-code bits of a group 0 frame record.
-- `calcEa`'s `write` flag exists for one case: a post-increment **read**
-  updates the register before the bus cycle, a **write** after it. So a
-  misaligned `move.w d0,(a0)+` faults with `a0` unchanged, while `move.w
-  (a0)+,d0` faults with `a0` already incremented.
+- `calcEa`'s `write` flag exists for the misaligned-fault cases, where the
+  conformance data pins down when the register writeback happens: a word
+  post-increment **read** updates the register before the bus cycle, but a
+  **write** — and a **long read**, whose first word access faults — leaves it
+  unchanged. A long predecrement **write** goes low word first, so its fault
+  address is `addr+2` and the register is not written back; reads go high
+  word first and fault with the register already decremented.
+- A faulting long operand only completed its first word access, so it pays
+  the word EA cost, not the long one (predecrement destinations excepted:
+  their cost discount already covers the first access).
 - **Each operand's cycle cost is charged before its own bus cycle**, so an
   instruction that faults partway through still pays for the work it did. A
   destination `-(An)` skips the two extra cycles a `-(An)` *source* spends
@@ -530,6 +536,12 @@ Per test case:
 
 Exclusions (documented upstream as faulty): `TAS`, `TRAPV`.
 
+Files for families the core does not implement yet are skipped and counted
+(the `implemented` list in `harness.zig`, which grows with each milestone), so
+the gate covers exactly what the core claims to do. Passing an explicit
+filter argument bypasses the list, so a family can be watched while it is
+being implemented.
+
 Reporting is three numbers per file plus the first state failure and the first
 cycle failure in each, with expected-vs-actual detail:
 
@@ -550,20 +562,31 @@ number instead of masking everything behind it.
 ### 5.4 Known gap: prefetch-derived group 0 frame fields
 
 There is exactly one accepted divergence, and it has one root cause: **no
-prefetch queue is modelled.** A real 68000 keeps two words in flight, and three
-fields of the 7-word address-error frame expose that internal state:
+prefetch queue or per-cycle microcode is modelled.** A real 68000 keeps two
+words in flight, and a group 0 fault freezes mid-instruction state that
+exposes it:
 
-| Frame offset | Field | What MAME stores |
+| Where | Field | What MAME stores |
 |---|---|---|
-| +0 | special status word, bits 5–15 | stale instruction register |
-| +6 | instruction register | often the *next* word, not the opcode |
-| +10 | program counter | an internal prefetch pointer |
+| frame +0 | special status word, bits 5–15 | stale instruction register |
+| frame +6 | instruction register | often the *next* word, not the opcode |
+| frame +10 | program counter | an internal prefetch pointer |
+| frame +8 and live SR | N/Z/V/C | flags as of the exact microcode step that faulted |
+
+The CCR case is the same disease in different clothes: MOVE latches flags at
+a fixed microcode point (before the write for word sizes and low-word-first
+predecrement destinations, after it otherwise — both modelled), but for
+destinations with extension words the latch interleaves with prefetch in ways
+only a cycle-stepped core reproduces. Faulting cases therefore compare SR
+with N/Z/V/C masked; non-faulting cases stay strict, so ordinary flag bugs
+still fail loudly.
 
 The low five bits of the SSW (R/W and the function code) *are* checked — they
 are architecturally defined, and checking them is what caught PC-relative reads
 being reported as data-space rather than program-space accesses.
 
-The behaviour was characterised empirically over the 1386 affected cases. With
+The stacked-PC behaviour was characterised empirically over the affected
+MOVE cases. With
 `n` the source EA's extension-word count and `start` the instruction address,
 the stacked PC is exactly `start + 4 − 2n` when the faulting access is a read
 and `start + 4 + 2n` when it is a write; the destination's extension words never
@@ -587,10 +610,12 @@ what M4 is for.
 | M5 | cycle tables tightened | all files pass cycle tier |
 | M6 | TUI debugger | interactive session against a test ROM |
 
-**Current status** (8 opcode files, 20000 cases): `NOP`, `MOVE.q`, `LEA`, `BSR`,
-`ILLEGAL_LINEA` and `ILLEGAL_LINEF` pass 2500/2500 on **both** tiers. `MOVE.w`
-and `MOVEA.w` account for all 1386 `aerr-pc` cases; every case of theirs that
-matches state also matches cycles exactly. **Unexplained failures: 0.**
+**Current status** (13 M1 opcode files, 32500 cases; the remaining 112
+upstream files are skipped as unimplemented): `NOP`, `MOVE.b`, `MOVE.q`,
+`LEA`, `BSR`, `ILLEGAL_LINEA` and `ILLEGAL_LINEF` pass 2500/2500 on **both**
+tiers. `MOVE.w/.l`, `MOVEA.w/.l`, `Bcc` and `RTS` account for all 4608
+`aerr-pc` cases; every case that matches state also matches cycles exactly.
+**Unexplained failures: 0.**
 
 ## 6. References
 
