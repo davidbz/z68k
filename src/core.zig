@@ -24,7 +24,6 @@ const EaMode = decode.EaMode;
 /// Aborts the instruction in progress. `step` turns these into exceptions.
 /// Using an error union here rather than a status code keeps every handler's
 /// happy path free of unwinding boilerplate.
-// TODO(M4): the TRAP/CHK/TRAPV faults, with the instructions that raise them.
 pub const Fault = error{
     AddressError,
     IllegalInstruction,
@@ -32,6 +31,8 @@ pub const Fault = error{
     LineF,
     PrivilegeViolation,
     ZeroDivide,
+    Chk,
+    Trap,
 };
 
 pub fn Core(comptime BusT: type) type {
@@ -46,7 +47,67 @@ pub fn Core(comptime BusT: type) type {
             /// Opcode currently executing. Only used to fill the group 0
             /// frame's instruction register word.
             ir: u16 = 0,
+            /// TRAP's vector depends on which of the 16 it is; every other
+            /// fault has a fixed one, so `faultVector` only reads this for
+            /// `Fault.Trap`.
+            trap_vector: Exception = .trap_0,
+            /// Set once a handler has passed a point where the group 0 frame's
+            /// PC diverges from the pre-fault fallback. IR keeps the fallback
+            /// value in every case here -- see the comment on `markPrefetch`.
+            prefetch: ?struct { ir: ?u16, pc: u32 } = null,
         };
+
+        /// Write-side mark: real hardware has already prefetched one word past
+        /// a memory destination's own EA/write cycle by fault time, so PC
+        /// ends up one word ahead of where it'd otherwise be -- regardless of
+        /// the destination's own extension-word count, even for absolute
+        /// destinations (unlike the read side, where the source's extension
+        /// words directly determine the prefetch advance -- see
+        /// `markReadFault`). The one exception: when the *source* operand
+        /// used no bus cycle at all (register direct), an absolute
+        /// destination's prefetch gets a second bonus word too, landing past
+        /// both its extension words instead of just one -- that spare source
+        /// bus slot is what buys it. IR sometimes follows along and
+        /// sometimes doesn't, in a way that (unlike PC) depends on the source
+        /// addressing mode's own internal bus timing (e.g. predecrement's
+        /// extra address-computation cycle) rather than just word counts --
+        /// not modeled here; see DESIGN.md §5.4.
+        fn markPrefetch(ctx: *Ctx, pc_before: u32, mode: EaMode, src_free: bool) void {
+            // abs_long has two extension words; "fully consumed" is +4. Every
+            // other mode's bonus is +2 either way, so only abs_long can tell
+            // the difference.
+            const bonus: u32 = if (src_free and mode == .abs_long) 4 else 2;
+            ctx.prefetch = .{ .ir = null, .pc = pc_before +% bonus };
+        }
+
+        /// Read-side mark: unlike a destination write, an operand read's own
+        /// extension-word fetches never get a chance to prefetch ahead
+        /// before the read itself faults, so PC stays exactly where it was
+        /// before this operand's addressing mode touched the bus at all --
+        /// regardless of how many extension words that addressing needed.
+        /// Predecrement is the one exception: its address-computation cycle
+        /// has no bus work of its own, giving the prefetch a free slot to
+        /// complete in before the read, same as a destination write. IR
+        /// keeps reflecting the instruction still executing, i.e. the
+        /// pre-fault fallback. See DESIGN.md §5.4.
+        fn markReadFault(ctx: *Ctx, pc_before: u32, mode: EaMode, size: Size) void {
+            // Modes with no ALU work between the last extension-word fetch
+            // and the access (predecrement's subtract, or absolute's fetched
+            // value used as-is) leave the bus idle for one extra prefetch;
+            // modes that must add the extension word to a register
+            // (displacement/indexed, base or PC-relative) don't, and the
+            // frame shows PC as if none of this operand's extension words
+            // had been fetched yet at all. Predecrement's bonus needs a
+            // word/byte-sized subtract to fit in that idle slot -- a long
+            // subtract takes long enough that the slot's gone, same as if
+            // there were no idle time at all.
+            const pc = switch (mode) {
+                .addr_predec => if (size == .long) pc_before else pc_before +% 2,
+                .abs_word, .abs_long, .addr_ind, .addr_postinc => ctx.cpu.pc,
+                else => pc_before,
+            };
+            ctx.prefetch = .{ .ir = null, .pc = pc };
+        }
 
         // ---------------------------------------------------------------- bus
 
@@ -82,6 +143,22 @@ pub fn Core(comptime BusT: type) type {
             try write16(ctx, addr +% 2, @truncate(v));
         }
 
+        /// One MOVEM register transfer's worth of predecrement/postincrement
+        /// address stepping. Checks alignment before committing the register
+        /// update in every case (read or write, word or long) - MOVEM has no
+        /// analog of the single-operand "word reads increment before the bus
+        /// cycle" quirk `calcEa` models for other instructions.
+        fn movemStep(ctx: *Ctx, reg: u3, size: Size, predec: bool, read: bool) Fault!u32 {
+            const cur = ctx.cpu.a[reg];
+            const addr = if (predec) cur -% size.bytes() else cur;
+            if (addr & 1 != 0) {
+                const fault_addr = if (predec and size == .long) addr +% 2 else addr;
+                return addressError(ctx, fault_addr, read, false);
+            }
+            ctx.cpu.a[reg] = if (predec) addr else addr +% size.bytes();
+            return addr;
+        }
+
         fn addressError(ctx: *Ctx, addr: u32, read: bool, program: bool) Fault {
             ctx.fault = .{ .access_addr = addr, .ir = ctx.ir, .read = read, .program = program };
             return Fault.AddressError;
@@ -109,6 +186,12 @@ pub fn Core(comptime BusT: type) type {
             try write32(ctx, ctx.cpu.a[7], v);
         }
 
+        fn pop16(ctx: *Ctx) Fault!u16 {
+            const v = try read16(ctx, ctx.cpu.a[7], false);
+            ctx.cpu.a[7] +%= 2;
+            return v;
+        }
+
         fn pop32(ctx: *Ctx) Fault!u32 {
             const v = try read32(ctx, ctx.cpu.a[7], false);
             ctx.cpu.a[7] +%= 4;
@@ -129,6 +212,16 @@ pub fn Core(comptime BusT: type) type {
         /// read-modify-write instruction computes the address, then reuses it.
         fn calcEa(ctx: *Ctx, mode: EaMode, reg: u3, size: Size, write: bool) Fault!u32 {
             const c = ctx.cpu;
+            // Marked up front, before any extension-word fetch or the
+            // predecrement/postincrement misalignment checks below: those
+            // checks raise `Fault.AddressError` straight out of this switch,
+            // never reaching a caller's own mark call, so every caller (not
+            // just MOVE) needs this covered here. `src_free` is a MOVE-only
+            // refinement (a register-direct source frees up a bus slot for
+            // an absolute destination); every other caller passes `false`,
+            // and MOVE's `writeEa` re-marks afterward when it applies.
+            const pc_before = c.pc;
+            if (write) markPrefetch(ctx, pc_before, mode, false) else markReadFault(ctx, pc_before, mode, size);
             return switch (mode) {
                 .addr_ind => c.a[reg],
                 .addr_postinc => blk: {
@@ -149,7 +242,9 @@ pub fn Core(comptime BusT: type) type {
                     // A long write goes low word first, so the first bus cycle
                     // is at addr+2 and a misaligned fault happens before the
                     // register writeback. Reads go high word first and fault
-                    // with the register already decremented.
+                    // with the register already decremented. Word writes
+                    // commit the register before the (later) fault too -
+                    // unlike long, there's no split access to catch it early.
                     if (write and size == .long and addr & 1 != 0) {
                         break :blk addressError(ctx, addr +% 2, false, false);
                     }
@@ -163,9 +258,16 @@ pub fn Core(comptime BusT: type) type {
                 .addr_index => try indexed(ctx, c.a[reg]),
                 .abs_word => blk: {
                     const w: i16 = @bitCast(try fetch16(ctx));
+                    // Read-side only: the extra word actually advances the
+                    // prefetch here, unlike the write side's flat bonus.
+                    if (!write) markReadFault(ctx, pc_before, mode, size);
                     break :blk @bitCast(@as(i32, w)); // sign extended
                 },
-                .abs_long => try fetch32(ctx),
+                .abs_long => blk: {
+                    const v = try fetch32(ctx);
+                    if (!write) markReadFault(ctx, pc_before, mode, size);
+                    break :blk v;
+                },
                 .pc_disp => blk: {
                     const base = c.pc;
                     const d: i16 = @bitCast(try fetch16(ctx));
@@ -205,7 +307,12 @@ pub fn Core(comptime BusT: type) type {
                     .word => try fetch16(ctx),
                     .long => try fetch32(ctx),
                 },
-                else => try readAt(ctx, try calcEa(ctx, mode, reg, size, false), size, mode.isProgram()),
+                else => blk: {
+                    // `calcEa` marks the prefetch state itself, including
+                    // for faults it raises internally.
+                    const addr = try calcEa(ctx, mode, reg, size, false);
+                    break :blk try readAt(ctx, addr, size, mode.isProgram());
+                },
             };
         }
 
@@ -225,7 +332,7 @@ pub fn Core(comptime BusT: type) type {
             }
         }
 
-        fn writeEa(ctx: *Ctx, mode: EaMode, reg: u3, size: Size, v: u32) Fault!void {
+        fn writeEa(ctx: *Ctx, mode: EaMode, reg: u3, size: Size, v: u32, src_free: bool) Fault!void {
             const c = ctx.cpu;
             switch (mode) {
                 .data_reg => setReg(&c.d[reg], size, v),
@@ -233,7 +340,15 @@ pub fn Core(comptime BusT: type) type {
                 // are sign extended across all 32 bits.
                 .addr_reg => c.a[reg] = signExtend(v, size),
                 .immediate => unreachable,
-                else => try writeAt(ctx, try calcEa(ctx, mode, reg, size, true), size, v),
+                else => {
+                    // `calcEa` marks the prefetch state itself (with
+                    // `src_free` always false); re-mark afterward when the
+                    // MOVE-specific refinement applies.
+                    const pc_before = ctx.cpu.pc;
+                    const addr = try calcEa(ctx, mode, reg, size, true);
+                    if (src_free and mode == .abs_long) markPrefetch(ctx, pc_before, mode, true);
+                    try writeAt(ctx, addr, size, v);
+                },
             }
         }
 
@@ -253,10 +368,10 @@ pub fn Core(comptime BusT: type) type {
         // ----------------------------------------------------------- exceptions
 
         /// Cycle cost of taking an exception (M68000UM exception timing).
-        /// TODO(M4): CHK (40) gets its own cost.
         fn exceptionCycles(e: Exception) u8 {
             if (e.isGroup0()) return 50;
             if (e == .zero_divide) return 38;
+            if (e == .chk) return 40;
             return 34;
         }
 
@@ -371,7 +486,17 @@ pub fn Core(comptime BusT: type) type {
             var ctx = Ctx{ .cpu = c, .bus = bus };
             const start_pc = c.pc;
             execute(&ctx) catch |f| {
-                if (ctx.fault) |*info| info.ir = bus.read16(@truncate(start_pc & ~@as(u32, 1)));
+                if (ctx.fault) |*info| {
+                    // Past the mark, real hardware has already prefetched the
+                    // next opcode into IR and advanced PC past it; before the
+                    // mark, both still reflect the faulting instruction itself.
+                    if (ctx.prefetch) |p| {
+                        info.ir = p.ir orelse bus.read16(@truncate(start_pc & ~@as(u32, 1)));
+                        c.pc = p.pc;
+                    } else {
+                        info.ir = bus.read16(@truncate(start_pc & ~@as(u32, 1)));
+                    }
+                }
                 // Illegal instruction and privilege violation stack the address
                 // of the offending instruction, not the one after it. The
                 // trap-like faults stack the following instruction.
@@ -381,7 +506,7 @@ pub fn Core(comptime BusT: type) type {
                     },
                     else => {},
                 }
-                enterException(c, bus, faultVector(f), ctx.fault);
+                enterException(c, bus, faultVector(f, &ctx), ctx.fault);
                 return;
             };
 
@@ -390,7 +515,7 @@ pub fn Core(comptime BusT: type) type {
             c.trace_pending = tracing;
         }
 
-        fn faultVector(f: Fault) Exception {
+        fn faultVector(f: Fault, ctx: *const Ctx) Exception {
             return switch (f) {
                 Fault.AddressError => .address_error,
                 Fault.IllegalInstruction => .illegal_instruction,
@@ -398,6 +523,8 @@ pub fn Core(comptime BusT: type) type {
                 Fault.LineF => .line_f,
                 Fault.PrivilegeViolation => .privilege_violation,
                 Fault.ZeroDivide => .zero_divide,
+                Fault.Chk => .chk,
+                Fault.Trap => ctx.trap_vector,
             };
         }
 
@@ -422,7 +549,13 @@ pub fn Core(comptime BusT: type) type {
                 .moveq => opMoveq(ctx, op),
                 .lea => try opLea(ctx, op),
                 .nop => {},
-                .rts => try jump(ctx, try pop32(ctx)),
+                .rts => {
+                    // Like Bcc/DBcc, the fault frame shows RTS's own
+                    // pre-jump PC, not the popped (bad) target.
+                    const ret = try pop32(ctx);
+                    ctx.prefetch = .{ .ir = null, .pc = ctx.cpu.pc };
+                    try jump(ctx, ret);
+                },
                 .bra, .bsr, .bcc => try opBranch(ctx, op, instr),
 
                 .negx, .clr, .neg, .not, .tst, .nbcd => try opAluSingle(ctx, op, instr),
@@ -443,11 +576,32 @@ pub fn Core(comptime BusT: type) type {
                 .mulu, .muls => try opMul(ctx, op, instr),
                 .divu, .divs => try opDiv(ctx, op, instr),
 
+                .swap => opSwap(ctx, op),
+                .ext => opExt(ctx, op, instr),
+                .pea => try opPea(ctx, op),
+                .link => try opLink(ctx, op),
+                .unlk => try opUnlk(ctx, op),
+                .jsr => try opJsr(ctx, op),
+                .jmp => try opJmp(ctx, op),
+                .move_from_sr => try opMoveFromSr(ctx, op),
+                .move_to_ccr => try opMoveToCcr(ctx, op),
+                .move_to_sr => try opMoveToSr(ctx, op),
+                .move_usp => try opMoveUsp(ctx, op),
+                .trap => try opTrap(ctx, op),
+                .trapv => try opTrapv(ctx),
+                .chk => try opChk(ctx, op),
+                .stop => try opStop(ctx),
+                .reset_insn => try opReset(ctx),
+                .rte => try opRte(ctx),
+                .rtr => try opRtr(ctx),
+                .movem => try opMovem(ctx, op, instr),
+                .tas => try opTas(ctx, op),
+
                 .line_a => return Fault.LineA,
                 .line_f => return Fault.LineF,
-                // TODO(M1-M4): the remaining families. Until a handler exists,
-                // the opcode behaves as an illegal instruction, which is a
-                // loud, correct-shaped failure rather than a silent no-op.
+                // ILLEGAL (0x4AFC) and any opcode decode couldn't identify
+                // both fall here, which is exactly right: the "illegal
+                // instruction" trap is itself an illegal instruction fault.
                 else => return Fault.IllegalInstruction,
             }
         }
@@ -494,7 +648,8 @@ pub fn Core(comptime BusT: type) type {
                 errdefer if (size == .long and dst_mode != .addr_predec) {
                     ctx.cpu.cycles -= 4;
                 };
-                try writeEa(ctx, dst_mode, dst_reg, size, v);
+                const src_free = src_mode == .data_reg or src_mode == .addr_reg;
+                try writeEa(ctx, dst_mode, dst_reg, size, v, src_free);
             }
             if (!flags_first) ctx.cpu.sr.setNzvc(cc);
         }
@@ -642,6 +797,11 @@ pub fn Core(comptime BusT: type) type {
                 c.cycles -= 2; // branch taken: 10 total, base covers the untaken 12
                 // The branch target is validated before Dn commits: a
                 // faulting branch (odd target) leaves Dn at its old value.
+                // Unlike Bcc's 8-bit form, DBcc always fetches its
+                // displacement word, and the fault frame reflects that
+                // fetch having completed -- the natural post-fetch PC,
+                // not the pre-fetch `base`.
+                ctx.prefetch = .{ .ir = null, .pc = ctx.cpu.pc };
                 try jump(ctx, base +% @as(u32, @bitCast(@as(i32, disp))));
                 setReg(&c.d[reg], .word, new_count);
             } else {
@@ -955,10 +1115,11 @@ pub fn Core(comptime BusT: type) type {
                 // predecrement read elsewhere, which always commits before
                 // the fault. Its bus cycle also goes low-word-first (fault
                 // address is addr+2, matching a long *write*'s ordering)
-                // even though it's only ever read. The second address
-                // cascades off the first's result when Ax and Ay are the
-                // same register.
+                // even though it's only ever read -- and its fault frame's
+                // PC follows the write-side prefetch rule too, for the same
+                // reason.
                 const src_addr = ctx.cpu.a[ry] -% stackAdjust(ry, size);
+                markPrefetch(ctx, ctx.cpu.pc, .addr_predec, false);
                 src = try predecLongRead(ctx, src_addr);
                 ctx.cpu.a[ry] = src_addr;
 
@@ -1070,12 +1231,20 @@ pub fn Core(comptime BusT: type) type {
                 const addr = ctx.cpu.a[ay];
                 if (addr & 1 != 0) {
                     ctx.cpu.a[ay] +%= 2;
+                    // Same bus-timing quirk as ADDX/SUBX's long predecrement
+                    // pair: this read's fault frame follows the write-side
+                    // prefetch rule, not a plain read's.
+                    markPrefetch(ctx, ctx.cpu.pc, .addr_postinc, false);
                     return addressError(ctx, addr, true, false);
                 }
                 ctx.cpu.a[ay] +%= 4;
                 break :blk try read32(ctx, addr, false);
             } else blk: {
                 const src_addr = try calcEa(ctx, .addr_postinc, ay, size, false);
+                // Same write-side prefetch timing as the long case above,
+                // even though this word/byte fault surfaces later, in the
+                // actual bus access rather than inside `calcEa` itself.
+                markPrefetch(ctx, ctx.cpu.pc, .addr_postinc, false);
                 break :blk try readAt(ctx, src_addr, size, false);
             };
             const dst_addr = calcEa(ctx, .addr_postinc, ax, size, true) catch |e| {
@@ -1243,6 +1412,331 @@ pub fn Core(comptime BusT: type) type {
             ctx.cpu.a[@as(u3, @truncate(op >> 9))] = addr;
         }
 
+        fn opSwap(ctx: *Ctx, op: u16) void {
+            const reg: u3 = @truncate(op);
+            const v = ctx.cpu.d[reg];
+            const swapped = (v << 16) | (v >> 16);
+            ctx.cpu.d[reg] = swapped;
+            ctx.cpu.sr.setNzvc(flags.logic(swapped, .long));
+        }
+
+        /// EXT.w sign extends the low byte into the low word (upper word
+        /// untouched); EXT.l sign extends the low word across the whole
+        /// register.
+        fn opExt(ctx: *Ctx, op: u16, instr: decode.Instr) void {
+            const reg: u3 = @truncate(op);
+            const v = if (instr.size == .word)
+                signExtend(ctx.cpu.d[reg] & 0xFF, .byte)
+            else
+                signExtend(ctx.cpu.d[reg] & 0xFFFF, .word);
+            setReg(&ctx.cpu.d[reg], instr.size, v);
+            ctx.cpu.sr.setNzvc(flags.logic(v, instr.size));
+        }
+
+        /// PEA: like `opLea` but pushes the computed address rather than
+        /// loading it into an address register.
+        fn opPea(ctx: *Ctx, op: u16) Fault!void {
+            const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const addr = try calcEa(ctx, mode, @truncate(op), .long, false);
+            try push32(ctx, addr);
+        }
+
+        /// LINK An,#d16: push An, An := SP, SP += d16. Pushing first and
+        /// reading `a[7]` as the value before `push32` decrements it is what
+        /// makes `LINK A7` self-consistent with no special case: the pushed
+        /// value is the old SP, and "An := SP" for An=A7 is then a no-op on
+        /// top of the push, matching the documented hardware quirk.
+        fn opLink(ctx: *Ctx, op: u16) Fault!void {
+            const reg: u3 = @truncate(op);
+            const disp: i16 = @bitCast(try fetch16(ctx));
+            try push32(ctx, ctx.cpu.a[reg]);
+            ctx.cpu.a[reg] = ctx.cpu.a[7];
+            ctx.cpu.a[7] +%= @as(u32, @bitCast(@as(i32, disp)));
+        }
+
+        /// UNLK An: SP := An, An := (SP)+. Reading through `An` rather than
+        /// through `a[7]` (i.e. not committing "SP := An" up front) matters
+        /// only when the read faults: on a real address error the stacked
+        /// frame is built from the *original* SP, not one already clobbered
+        /// with the (possibly odd) An value, so both writes must land
+        /// together only once the read has actually succeeded. That also
+        /// makes `UNLK A7` fall out for free: reg==7 means the final
+        /// `a[reg] = v` assignment overwrites the `a[7] = sp +% 4` one, so A7
+        /// ends up holding the popped value, matching hardware.
+        fn opUnlk(ctx: *Ctx, op: u16) Fault!void {
+            const reg: u3 = @truncate(op);
+            const sp = ctx.cpu.a[reg];
+            // Empirically follows the write-side prefetch timing (see
+            // `markPrefetch`), not a plain read's, despite reading An's
+            // contents rather than writing anything.
+            markPrefetch(ctx, ctx.cpu.pc, .addr_ind, false);
+            const v = try read32(ctx, sp, false);
+            ctx.cpu.a[7] = sp +% 4;
+            ctx.cpu.a[reg] = v;
+        }
+
+        /// Jump before push: on real hardware an odd target faults with no
+        /// return address ever pushed, so the target has to be committed
+        /// (and validated) before the stack is touched.
+        fn opJsr(ctx: *Ctx, op: u16) Fault!void {
+            const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const addr = try calcEa(ctx, mode, @truncate(op), .long, false);
+            // Unlike a data read (see `markReadFault`), JSR's EA computation
+            // never reads the target as data, and empirically always shows
+            // the fully-advanced post-EA PC in the fault frame, regardless
+            // of addressing mode -- so this overrides `calcEa`'s baked-in
+            // mark uniformly rather than following its mode split.
+            ctx.prefetch = .{ .ir = null, .pc = ctx.cpu.pc };
+            const ret = ctx.cpu.pc;
+            try jump(ctx, addr);
+            try push32(ctx, ret);
+        }
+
+        fn opJmp(ctx: *Ctx, op: u16) Fault!void {
+            const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const pc_before = ctx.cpu.pc;
+            const addr = try calcEa(ctx, mode, @truncate(op), .long, false);
+            // JMP is JSR's mirror: always rolls back to the pre-EA PC,
+            // regardless of addressing mode.
+            ctx.prefetch = .{ .ir = null, .pc = pc_before };
+            try jump(ctx, addr);
+        }
+
+        /// Real hardware does a dummy read of the destination before writing
+        /// SR there (well-documented MOVE-from-SR quirk), so an odd address
+        /// faults as a read, not a write: matters for the stacked SSW.
+        fn opMoveFromSr(ctx: *Ctx, op: u16) Fault!void {
+            const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const reg: u3 = @truncate(op);
+            const v: u32 = ctx.cpu.sr.toInt();
+            if (mode == .data_reg) {
+                setReg(&ctx.cpu.d[reg], .word, v);
+            } else {
+                ctx.cpu.cycles += mode.destCycles(.word);
+                // `write=false`: the dummy read makes this destination
+                // behave like a read for postinc/predec's fault-vs-register
+                // ordering, matching the bus cycle that actually faults.
+                const addr = try calcEa(ctx, mode, reg, .word, false);
+                _ = try read16(ctx, addr, false);
+                try writeAt(ctx, addr, .word, v);
+            }
+        }
+
+        fn opMoveToCcr(ctx: *Ctx, op: u16) Fault!void {
+            const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const reg: u3 = @truncate(op);
+            ctx.cpu.cycles += mode.cycles(.word);
+            const v = try readEa(ctx, mode, reg, .word);
+            const full = (ctx.cpu.sr.toInt() & 0xFF00) | (v & 0xFF);
+            ctx.cpu.sr = cpu_mod.StatusRegister.fromInt(@truncate(full));
+        }
+
+        /// Privileged: a user-mode attempt faults before the source operand
+        /// is even read.
+        fn opMoveToSr(ctx: *Ctx, op: u16) Fault!void {
+            if (!ctx.cpu.sr.s) return Fault.PrivilegeViolation;
+            const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const reg: u3 = @truncate(op);
+            ctx.cpu.cycles += mode.cycles(.word);
+            const v = try readEa(ctx, mode, reg, .word);
+            const new_sr = cpu_mod.StatusRegister.fromInt(@truncate(v));
+            ctx.cpu.setSupervisor(new_sr.s);
+            ctx.cpu.sr = new_sr;
+        }
+
+        /// MOVE USP: bit 3 of the opcode picks direction, since `Instr` has
+        /// no direction field (same convention as MOVEP).
+        fn opMoveUsp(ctx: *Ctx, op: u16) Fault!void {
+            if (!ctx.cpu.sr.s) return Fault.PrivilegeViolation;
+            const reg: u3 = @truncate(op);
+            if (op & 0x0008 != 0) {
+                ctx.cpu.a[reg] = ctx.cpu.usp;
+            } else {
+                ctx.cpu.usp = ctx.cpu.a[reg];
+            }
+        }
+
+        fn opTrap(ctx: *Ctx, op: u16) Fault!void {
+            const n: u8 = @truncate(op & 0xF);
+            ctx.trap_vector = @enumFromInt(@intFromEnum(Exception.trap_0) + n);
+            return Fault.Trap;
+        }
+
+        fn opTrapv(ctx: *Ctx) Fault!void {
+            if (!ctx.cpu.sr.v) return;
+            ctx.trap_vector = .trapv;
+            return Fault.Trap;
+        }
+
+        /// CHK: faults if Dn (as a signed word) is negative or exceeds the
+        /// ea bound. The documented "N set if Dn<0, cleared if Dn>bound" is
+        /// just what a
+        /// plain `TST Dn` already gives: real hardware sets NZVC from Dn
+        /// alone (V/C always clear, same as `flags.logic`), not from a
+        /// comparison against the bound.
+        fn opChk(ctx: *Ctx, op: u16) Fault!void {
+            const dn: u3 = @truncate(op >> 9);
+            const ea_mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const ea_reg: u3 = @truncate(op);
+            ctx.cpu.cycles += ea_mode.cycles(.word);
+            const bound: i16 = @bitCast(@as(u16, @truncate(try readEa(ctx, ea_mode, ea_reg, .word))));
+            const v: i16 = @bitCast(@as(u16, @truncate(ctx.cpu.d[dn])));
+            ctx.cpu.sr.setNzvc(flags.logic(ctx.cpu.d[dn], .word));
+            if (v < 0 or v > bound) return Fault.Chk;
+        }
+
+        /// STOP freezes the bus: no further prefetch happens, so unlike every
+        /// other instruction the PC does not settle 4 bytes past where it
+        /// started (the harness's uniform `pc_prefetch_offset` correction
+        /// assumes prefetch resumes at the new PC, which here it never
+        /// does). Rewinding by 4 undoes both this fetch and the opcode
+        /// fetch `execute` already did, landing PC back on STOP itself.
+        fn opStop(ctx: *Ctx) Fault!void {
+            if (!ctx.cpu.sr.s) return Fault.PrivilegeViolation;
+            const v = try fetch16(ctx);
+            const new_sr = cpu_mod.StatusRegister.fromInt(v);
+            ctx.cpu.setSupervisor(new_sr.s);
+            ctx.cpu.sr = new_sr;
+            ctx.cpu.stopped = true;
+            ctx.cpu.pc -%= 4;
+        }
+
+        /// RESET pulses the reset line for external devices. This core has
+        /// none to reset, so it is host-facing only: privileged, and costs
+        /// cycles, but has no further effect (real hardware doesn't reset
+        /// itself either).
+        fn opReset(ctx: *Ctx) Fault!void {
+            if (!ctx.cpu.sr.s) return Fault.PrivilegeViolation;
+        }
+
+        /// RTE: pops SR then PC (word then long, matching the frame `frame`
+        /// builds). Only the base 68000's format-less frame exists here, so
+        /// this is a plain pop with no format-word dispatch. `jump`, not a
+        /// plain assignment, for the same reason RTS/JMP/JSR use it: the
+        /// implied prefetch at the restored PC happens immediately, so an
+        /// odd popped PC faults within this instruction, not the next.
+        fn opRte(ctx: *Ctx) Fault!void {
+            if (!ctx.cpu.sr.s) return Fault.PrivilegeViolation;
+            const sr_word = try pop16(ctx);
+            const pc = try pop32(ctx);
+            const new_sr = cpu_mod.StatusRegister.fromInt(sr_word);
+            ctx.cpu.setSupervisor(new_sr.s);
+            ctx.cpu.sr = new_sr;
+            // Like RTS, the fault frame shows RTE's own pre-jump PC, not
+            // the popped (bad) target.
+            ctx.prefetch = .{ .ir = null, .pc = ctx.cpu.pc };
+            try jump(ctx, pc);
+        }
+
+        /// RTR: pops CCR then PC. Unlike RTE, only the CCR byte is restored
+        /// (the upper SR byte, and supervisor mode, are untouched), so it
+        /// needs no privilege check. `jump`, as in `opRte`, for the implied
+        /// prefetch at the restored PC.
+        fn opRtr(ctx: *Ctx) Fault!void {
+            const ccr_word = try pop16(ctx);
+            const pc = try pop32(ctx);
+            const full = (ctx.cpu.sr.toInt() & 0xFF00) | (ccr_word & 0xFF);
+            ctx.cpu.sr = cpu_mod.StatusRegister.fromInt(full);
+            // Same as RTE/RTS: fault frame shows the pre-jump PC.
+            ctx.prefetch = .{ .ir = null, .pc = ctx.cpu.pc };
+            try jump(ctx, pc);
+        }
+
+        /// TAS: byte read-modify-write, same address-once shape as
+        /// `opAluSingle`'s RMW cases. Tests the old value into N/Z (clearing
+        /// V/C), then unconditionally sets bit 7 on write-back.
+        fn opTas(ctx: *Ctx, op: u16) Fault!void {
+            const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const reg: u3 = @truncate(op);
+            var addr: u32 = undefined;
+            const old: u8 = if (mode == .data_reg)
+                @truncate(ctx.cpu.d[reg])
+            else blk: {
+                addr = try calcEa(ctx, mode, reg, .byte, false);
+                break :blk @truncate(try readAt(ctx, addr, .byte, false));
+            };
+            ctx.cpu.sr.setNzvc(flags.logic(old, .byte));
+            const new_v = old | 0x80;
+            if (mode == .data_reg) {
+                setReg(&ctx.cpu.d[reg], .byte, new_v);
+            } else {
+                try writeAt(ctx, addr, .byte, new_v);
+            }
+        }
+
+        /// MOVEM: register list <-> memory. Every mode but predecrement maps
+        /// mask bit i (0-indexed from the LSB) to register i (0-7 = D0-D7,
+        /// 8-15 = A0-A7) and walks addresses ascending. Predecrement
+        /// (store only) reverses the mapping (bit i -> register 15-i, so
+        /// bit 0 = A7) while still walking the mask LSB-first, which
+        /// produces descending register order over descending addresses —
+        /// landing on the same D0-lowest memory layout the other modes read
+        /// back with their own bit order.
+        fn opMovem(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            const size = instr.size;
+            const load = op & 0x0400 != 0;
+            const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const reg: u3 = @truncate(op);
+            const mask = try fetch16(ctx);
+            const predec = mode == .addr_predec;
+            const postinc = mode == .addr_postinc;
+            const orig_an = ctx.cpu.a[reg];
+
+            // Non-indexing modes compute the base address once; predec/postinc
+            // instead step it once *per register* via `movemStep`, since each
+            // transfer is its own bus cycle with its own predecrement/
+            // postincrement. Unlike a single-operand instruction's (An)/-(An)
+            // (see `calcEa`), MOVEM always checks alignment before committing
+            // the register update for every combination, including word
+            // reads - there's no "increments before the bus cycle" quirk here.
+            var addr: u32 = if (predec or postinc) 0 else try calcEa(ctx, mode, reg, size, false);
+
+            // Every register transfer is its own bus cycle, so a fault on
+            // any of them (not just the first) needs marking -- but
+            // empirically they all follow the same write-side-style flat
+            // bonus (see `markPrefetch`) over the PC as it sits once the
+            // mask word and any EA extension words are already fetched,
+            // regardless of which register in the list actually faults.
+            const pc_after_setup = ctx.cpu.pc;
+            markPrefetch(ctx, pc_after_setup, .addr_ind, false);
+
+            var count: u32 = 0;
+            var i: u5 = 0;
+            while (i < 16) : (i += 1) {
+                if (mask & (@as(u16, 1) << @truncate(i)) == 0) continue;
+                const which: u5 = if (predec) 15 - i else i;
+                const rn: u3 = @truncate(which);
+                const is_addr = which >= 8;
+                count += 1;
+
+                const cur = if (predec or postinc) try movemStep(ctx, reg, size, predec, load) else blk: {
+                    const a = addr;
+                    addr +%= size.bytes();
+                    break :blk a;
+                };
+
+                if (load) {
+                    const v = signExtend(try readAt(ctx, cur, size, mode.isProgram()), size);
+                    // (An)+ loading An itself: the auto-incremented address
+                    // calcEa already wrote into An wins over the value just
+                    // read from memory, unlike the reverse (store) case.
+                    if (is_addr and rn == reg and postinc) {} else if (is_addr) ctx.cpu.a[rn] = v else setReg(&ctx.cpu.d[rn], .long, v);
+                } else {
+                    // -(An) storing An itself: real hardware stores the
+                    // register's value from *before* the instruction
+                    // started, not the (partially or fully) decremented
+                    // address, despite An having already been decremented
+                    // by the time its own slot is written.
+                    const v = if (is_addr and rn == reg and predec)
+                        orig_an
+                    else if (is_addr) ctx.cpu.a[rn] else ctx.cpu.d[rn];
+                    try writeAt(ctx, cur, size, v);
+                }
+            }
+
+            ctx.cpu.cycles += @as(u64, count) * (if (size == .long) @as(u64, 8) else 4);
+        }
+
         fn opBranch(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
             const c = ctx.cpu;
             const base = c.pc; // address of the extension word
@@ -1255,7 +1749,14 @@ pub fn Core(comptime BusT: type) type {
             const target = base +% @as(u32, @bitCast(disp));
 
             switch (instr.mnemonic) {
-                .bra => try jump(ctx, target),
+                .bra => {
+                    // Unlike BSR (which also pushes a return address), a
+                    // plain branch's fault frame shows its own pre-branch
+                    // PC, not the bad target -- as if the branch had never
+                    // been attempted.
+                    ctx.prefetch = .{ .ir = null, .pc = base };
+                    try jump(ctx, target);
+                },
                 .bsr => {
                     // The return address is written before the new PC is
                     // prefetched, so an odd target still leaves it on the stack.
@@ -1265,6 +1766,7 @@ pub fn Core(comptime BusT: type) type {
                 .bcc => {
                     if (flags.testCondition(c.sr, @truncate(op >> 8))) {
                         c.cycles += 2; // taken is 10, base covers the not-taken 8
+                        ctx.prefetch = .{ .ir = null, .pc = base };
                         try jump(ctx, target);
                     } else {
                         // Not taken costs less; the 16-bit form costs more.
@@ -1280,9 +1782,14 @@ pub fn Core(comptime BusT: type) type {
         /// it prefetches from the new address, which is still inside this
         /// instruction.
         fn jump(ctx: *Ctx, target: u32) Fault!void {
-            // The PC is loaded first and the prefetch from it is what faults,
-            // so the address error frame stacks the target, not the return
-            // address.
+            // The PC is loaded first and the prefetch from it is what
+            // faults, so by default the address error frame stacks the
+            // target, not the return address -- true for BSR/JMP/JSR's
+            // successful-EA case. Callers where that's empirically wrong
+            // (Bcc/DBcc, RTS, RTE, RTR -- the frame shows their own
+            // pre-jump PC instead, as if the jump had never been
+            // attempted) override `ctx.prefetch` themselves before calling
+            // this, which takes priority in the fault path.
             ctx.cpu.pc = target;
             if (target & 1 != 0) return addressError(ctx, target, true, true);
         }

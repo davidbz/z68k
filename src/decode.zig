@@ -279,7 +279,7 @@ pub fn decodeOne(op: u16) Instr {
 
                 // NBCD: 0100 1000 00 mmm rrr, byte-only BCD negate. Its own
                 // fixed slot at the 0x48 nibble's ss=00; ss=01 there is
-                // SWAP/PEA instead (still TODO(M4)).
+                // SWAP/PEA, ss=10/11 EXT/MOVEM (below).
                 if (op & 0xFFC0 == 0x4800) {
                     const ea = EaMode.decode(mode, reg) orelse break :blk illegal;
                     if (!ea_data_alterable.contains(ea)) break :blk illegal;
@@ -290,9 +290,82 @@ pub fn decodeOne(op: u16) Instr {
                     };
                 }
 
+                // SWAP/PEA share 0x4840-0x487F: SWAP is the ea=data_reg
+                // subset (Dn only, the mode PEA's control-only class already
+                // excludes), PEA the rest.
+                if (op & 0xFFC0 == 0x4840) {
+                    const ea = EaMode.decode(mode, reg) orelse break :blk illegal;
+                    if (ea == .data_reg) break :blk .{ .mnemonic = .swap, .base_cycles = 4 };
+                    if (!ea_control.contains(ea)) break :blk illegal;
+                    break :blk .{
+                        .mnemonic = .pea,
+                        .size = .long,
+                        .base_cycles = switch (ea) {
+                            .addr_ind => 12,
+                            .addr_disp, .abs_word, .pc_disp => 16,
+                            .addr_index, .abs_long, .pc_index => 20,
+                            else => unreachable,
+                        },
+                    };
+                }
+
+                // EXT/MOVEM (reg->mem direction) share 0x4880-0x48FF: bit 6
+                // picks word/long, EXT is the ea=data_reg subset (MOVEM's ea
+                // never allows Dn/An anyway), MOVEM the rest.
+                if (op & 0xFF80 == 0x4880) {
+                    const size: Size = if (op & 0x0040 != 0) .long else .word;
+                    if (mode == 0) break :blk .{ .mnemonic = .ext, .size = size, .base_cycles = 4 };
+                    break :blk decodeMovem(mode, reg, size, false);
+                }
+                // MOVEM, mem->reg direction: 0x4C80-0x4CFF.
+                if (op & 0xFF80 == 0x4C80) {
+                    const size: Size = if (op & 0x0040 != 0) .long else .word;
+                    break :blk decodeMovem(mode, reg, size, true);
+                }
+
+                // TRAP #n: 0x4E40-0x4E4F.
+                if (op & 0xFFF0 == 0x4E40) break :blk .{ .mnemonic = .trap };
+                // LINK/UNLK: 0x4E50-0x4E5F, bit 3 picks which.
+                if (op & 0xFFF8 == 0x4E50) break :blk .{ .mnemonic = .link, .size = .long, .base_cycles = 16 };
+                if (op & 0xFFF8 == 0x4E58) break :blk .{ .mnemonic = .unlk, .base_cycles = 12 };
+                // MOVE USP: 0x4E60-0x4E6F, bit 3 picks direction (handler
+                // re-reads it, same as MOVEP's direction bits).
+                if (op & 0xFFF0 == 0x4E60) break :blk .{ .mnemonic = .move_usp, .size = .long, .base_cycles = 4 };
+
+                // JSR/JMP: 0100 1110 1 d mmm rrr, control EAs only.
+                if (op & 0xFF80 == 0x4E80) {
+                    const ea = EaMode.decode(mode, reg) orelse break :blk illegal;
+                    if (!ea_control.contains(ea)) break :blk illegal;
+                    const is_jmp = op & 0x0040 != 0;
+                    const jsr_costs = [_]u8{ 16, 18, 22, 18, 20, 18, 22 };
+                    const jmp_costs = [_]u8{ 8, 10, 14, 10, 12, 10, 14 };
+                    const idx: usize = switch (ea) {
+                        .addr_ind => 0,
+                        .addr_disp => 1,
+                        .addr_index => 2,
+                        .abs_word => 3,
+                        .abs_long => 4,
+                        .pc_disp => 5,
+                        .pc_index => 6,
+                        else => unreachable,
+                    };
+                    break :blk .{
+                        .mnemonic = if (is_jmp) .jmp else .jsr,
+                        .base_cycles = if (is_jmp) jmp_costs[idx] else jsr_costs[idx],
+                    };
+                }
+
+                // CHK: 0100 ddd1 10 mmm rrr, word only on the base 68000.
+                if (op & 0x01C0 == 0x0180) {
+                    const ea = EaMode.decode(mode, reg) orelse break :blk illegal;
+                    if (!ea_data.contains(ea)) break :blk illegal;
+                    break :blk .{ .mnemonic = .chk, .size = .word, .base_cycles = 10 };
+                }
+
                 // Single-operand ALU forms: NEGX/CLR/NEG/NOT/TST, all shaped
-                // 0100 oooo ssmmmrrr. Everything else on this line (TRAP, CHK,
-                // JSR, JMP, PEA, LINK, MOVEM, ...) is TODO(M4).
+                // 0100 oooo ssmmmrrr. Size field 11 is a reserved slot at four
+                // of these prefixes, repurposed for MOVEfromSR/MOVEtoCCR/
+                // MOVEtoSR/TAS (CLR's is genuinely unused).
                 const mn: ?Mnemonic = switch (op & 0xFF00) {
                     0x4000 => .negx,
                     0x4200 => .clr,
@@ -303,9 +376,15 @@ pub fn decodeOne(op: u16) Instr {
                 };
                 if (mn) |m| {
                     const size_field: u2 = @truncate(op >> 6);
-                    // size 11 is a reserved slot here: TAS under tst's
-                    // prefix — not this family, TODO(M3+).
-                    if (size_field == 0b11) break :blk illegal;
+                    if (size_field == 0b11) {
+                        break :blk switch (m) {
+                            .negx => decodeMoveFromSr(mode, reg),
+                            .neg => decodeMoveToCcr(mode, reg),
+                            .not => decodeMoveToSr(mode, reg),
+                            .tst => decodeTas(mode, reg),
+                            else => illegal,
+                        };
+                    }
                     const size: Size = @enumFromInt(size_field);
                     const ea = EaMode.decode(mode, reg) orelse break :blk illegal;
                     if (!ea_data_alterable.contains(ea)) break :blk illegal;
@@ -319,7 +398,7 @@ pub fn decodeOne(op: u16) Instr {
                     };
                 }
 
-                break :blk illegal; // TODO(M4): rest of the 0100 line
+                break :blk illegal;
             },
         },
 
@@ -651,6 +730,50 @@ fn decodeImmediateAlu(op: u16, mode: u3, reg: u3) Instr {
     };
 }
 
+/// MOVEM register list <-> memory. `load` picks the mem->reg direction
+/// (control EAs plus postincrement); store (reg->mem) allows control EAs
+/// plus predecrement instead. Base cost is a per-register 4, doubled for
+/// long; the handler adds 2 more per register actually transferred plus
+/// this floor already covers the fixed ea/extension-word overhead.
+fn decodeMovem(mode: u3, reg: u3, size: Size, load: bool) Instr {
+    const ea = EaMode.decode(mode, reg) orelse return illegal;
+    const ok = if (load)
+        ea_control.contains(ea) or ea == .addr_postinc
+    else
+        ea_control.intersectWith(ea_alterable).contains(ea) or ea == .addr_predec;
+    if (!ok) return illegal;
+    return .{ .mnemonic = .movem, .size = size, .base_cycles = if (load) 12 else 8 };
+}
+
+/// MOVE from SR: 0100000011 mmm rrr, the size=11 slot under NEGX's prefix.
+fn decodeMoveFromSr(mode: u3, reg: u3) Instr {
+    const ea = EaMode.decode(mode, reg) orelse return illegal;
+    if (!ea_data_alterable.contains(ea)) return illegal;
+    return .{ .mnemonic = .move_from_sr, .size = .word, .base_cycles = if (ea == .data_reg) @as(u8, 6) else 8 };
+}
+
+/// MOVE to CCR: 0100010011 mmm rrr, the size=11 slot under NEG's prefix.
+fn decodeMoveToCcr(mode: u3, reg: u3) Instr {
+    const ea = EaMode.decode(mode, reg) orelse return illegal;
+    if (!ea_data.contains(ea)) return illegal;
+    return .{ .mnemonic = .move_to_ccr, .size = .word, .base_cycles = 12 };
+}
+
+/// MOVE to SR: 0100011011 mmm rrr, the size=11 slot under NOT's prefix.
+/// Privileged; the handler checks that.
+fn decodeMoveToSr(mode: u3, reg: u3) Instr {
+    const ea = EaMode.decode(mode, reg) orelse return illegal;
+    if (!ea_data.contains(ea)) return illegal;
+    return .{ .mnemonic = .move_to_sr, .size = .word, .base_cycles = 12 };
+}
+
+/// TAS: 0100101011 mmm rrr, the size=11 slot under TST's prefix.
+fn decodeTas(mode: u3, reg: u3) Instr {
+    const ea = EaMode.decode(mode, reg) orelse return illegal;
+    if (!ea_data_alterable.contains(ea)) return illegal;
+    return .{ .mnemonic = .tas, .size = .byte, .base_cycles = if (ea == .data_reg) @as(u8, 4) else 10 };
+}
+
 fn decodeMove(op: u16) Instr {
     const size = Size.fromMoveField(@truncate(op >> 12)) orelse return illegal;
 
@@ -764,8 +887,8 @@ test "single-operand ALU forms" {
     try std.testing.expectEqual(Mnemonic.illegal, table[0x4A88].mnemonic);
     // clr.b #imm-shaped bits (mode=111,reg=100) — immediate not alterable.
     try std.testing.expectEqual(Mnemonic.illegal, table[0x423C].mnemonic);
-    // size field 11 under negx's prefix is NBCD, not our family: illegal for now.
-    try std.testing.expectEqual(Mnemonic.illegal, table[0x40C0].mnemonic);
-    // size field 11 under tst's prefix is TAS: illegal for now too.
-    try std.testing.expectEqual(Mnemonic.illegal, table[0x4AC0].mnemonic);
+    // size field 11 under negx's prefix is MOVE from SR, not our family.
+    try std.testing.expectEqual(Mnemonic.move_from_sr, table[0x40C0].mnemonic);
+    // size field 11 under tst's prefix is TAS.
+    try std.testing.expectEqual(Mnemonic.tas, table[0x4AC0].mnemonic);
 }

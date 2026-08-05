@@ -559,45 +559,32 @@ number instead of masking everything behind it.
 - `zig build test` on every push (existing GitHub Actions).
 - SST harness as a manual/nightly workflow (test data is hundreds of MB).
 
-### 5.4 Known gap: prefetch-derived group 0 frame fields
+### 5.4 Known gap: group 0 frame IR field
 
-There is exactly one accepted divergence, and it has one root cause: **no
-prefetch queue or per-cycle microcode is modelled.** A real 68000 keeps two
-words in flight, and a group 0 fault freezes mid-instruction state that
-exposes it:
+M4 added a real prefetch-queue mark (`Ctx.prefetch`): handlers that can fault
+on a memory access past the point where a real 68000 has already fetched the
+next opcode call `markPrefetch`/set `ctx.prefetch` explicitly at that point,
+and the fault path uses the marked PC instead of the natural one when
+present. This fixed the stacked PC (frame +10) for every family — each
+addressing mode's/instruction's mark point was derived empirically from
+conformance data, the same way the old MOVE-only `start+4∓2n` formula was,
+but per-instruction rather than as one shared rule (the same mode can need a
+different mark depending on which instruction uses it: JSR's `(xxx).w` EA
+marks the post-EA PC, JMP's identical EA marks the pre-EA PC, since one
+pushes a return address into the fault-safe path and the other doesn't). The
+SSW's low five bits and the CCR-masked SR compare are unaffected by this and
+still checked as before.
 
-| Where | Field | What MAME stores |
-|---|---|---|
-| frame +0 | special status word, bits 5–15 | stale instruction register |
-| frame +6 | instruction register | often the *next* word, not the opcode |
-| frame +10 | program counter | an internal prefetch pointer |
-| frame +8 and live SR | N/Z/V/C | flags as of the exact microcode step that faulted |
-
-The CCR case is the same disease in different clothes: MOVE latches flags at
-a fixed microcode point (before the write for word sizes and low-word-first
-predecrement destinations, after it otherwise — both modelled), but for
-destinations with extension words the latch interleaves with prefetch in ways
-only a cycle-stepped core reproduces. Faulting cases therefore compare SR
-with N/Z/V/C masked; non-faulting cases stay strict, so ordinary flag bugs
-still fail loudly.
-
-The low five bits of the SSW (R/W and the function code) *are* checked — they
-are architecturally defined, and checking them is what caught PC-relative reads
-being reported as data-space rather than program-space accesses.
-
-The stacked-PC behaviour was characterised empirically over the affected
-MOVE cases. With
-`n` the source EA's extension-word count and `start` the instruction address,
-the stacked PC is exactly `start + 4 − 2n` when the faulting access is a read
-and `start + 4 + 2n` when it is a write; the destination's extension words never
-matter. The mechanism behind the asymmetry is visible in the frame's IR field:
-for a MOVE with a memory destination the next-instruction prefetch happens
-*before* the write, so by fault time both PC and IR have already advanced.
-
-This is deliberately **not** encoded as a formula in the fault path. It would be
-a MOVE-shaped rule living in shared code, needing rederivation for every family
-added in M2/M3. A real prefetch queue fixes all three fields at once, which is
-what M4 is for.
+One field resists it: **frame +6, the instruction register.** MAME's IR is
+sometimes the original opcode and sometimes the next prefetched word,
+depending on exact microcode timing that doesn't reduce to "the word at the
+marked PC" — that hypothesis was tried and made results far worse (MOVE.w's
+passing state cases dropped from 2380/2500 to 1013/2500), since most marked
+fault cases keep the *original* opcode in IR, not the next word. Reproducing
+it needs real per-cycle microcode stepping, which is out of scope for the
+prefetch-queue abstraction built here. It's isolated to two files,
+`MOVE.l`/`MOVE.w` (369 + 120 = 489 cases out of 312500, ≈0.16%), and counted
+as `aerr-pc`, never silently passed.
 
 ### 5.5 Milestone gates
 
@@ -606,7 +593,7 @@ what M4 is for.
 | M1 | decode table, MOVE/MOVEA/MOVEQ, harness runs | MOVE* files pass state tier |
 | M2 | ALU families + flags | arithmetic/logic files pass state tier |
 | M3 | shifts, bits, BCD, EXG, MUL/DIV | their files pass state tier |
-| M4 | prefetch queue; remaining exceptions | **all** files pass state tier, `aerr-pc` reaches 0 |
+| M4 | prefetch queue; remaining exceptions | **all** files pass state tier, `aerr-pc` isolated to a documented remainder |
 | M5 | cycle tables tightened | all files pass cycle tier |
 | M6 | TUI debugger | interactive session against a test ROM |
 
@@ -667,6 +654,29 @@ fires when the raw operands are exactly equal but a low-nibble borrow still
 occurs); and DIVU/DIVS set N unconditionally on quotient overflow, regardless
 of the (discarded) quotient's actual sign. See `flags.zig`'s `bcdAdd`/`bcdSub`
 and `core.zig`'s `opDiv` for the derivations.
+
+**M4 status** (125 opcode files, 312500 cases; 0 upstream files skipped —
+every implemented family from the ISA now has a handler): CHK, EXT.w/l,
+JMP, JSR, LINK/UNLK, MOVE to/from CCR/SR, MOVE to/from USP, MOVEM.w/l, PEA,
+RESET, RTE, RTR, STOP, SWAP, TAS, TRAP, TRAPV round out the `0100` opcode
+line's remaining handlers, and the `Ctx.prefetch` mark (§5.4) rolled out
+across every family with a nonzero `aerr-pc`. **All 125 files pass the state
+tier with zero unexplained failures.** `aerr-pc` is 489 (down from a peak of
+~26000 pre-rollout), entirely confined to MOVE.l/MOVE.w's IR field — the one
+gap that resisted the mark mechanism (§5.4).
+
+Several control-flow families needed bespoke, instruction-specific mark
+points rather than a mode-keyed rule in `calcEa`, mirroring M2/M3's
+ADDX/SUBX/CMPM pattern: JMP marks the pre-EA PC while JSR (identical
+addressing modes) marks the post-EA PC, since JSR's return-address push
+changes what the fault-safe path should show; BRA/Bcc-taken mark their own
+pre-branch PC ("as if the branch had never been attempted") while BSR keeps
+the target, since only BSR also pushes a return address; DBcc's mandatory
+16-bit displacement fetch marks the natural post-fetch PC, unlike Bcc's
+optional 8-bit form; RTS/RTE/RTR all mark their own pre-jump PC rather than
+the popped target; MOVEM marks once per instruction (after its mask word
+and any EA extension words), applied uniformly to whichever register in the
+transfer list actually faults.
 
 ## 6. References
 

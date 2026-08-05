@@ -7,23 +7,28 @@ knowledge of any particular machine: the host supplies the bus.
 Accuracy is validated against the MAME-generated
 [SingleStepTests/m68000](https://github.com/SingleStepTests/m68000) suite, at
 the level of architectural state (registers, SR, PC, memory) and total
-per-instruction cycle counts. The prefetch queue and per-cycle bus activity are
-not modelled; see [DESIGN.md](DESIGN.md) for the rationale and the one known
-divergence this causes.
+per-instruction cycle counts. Per-cycle bus activity isn't modelled, and a
+prefetch-queue approximation covers most, but not all, of the fault-frame
+effects that has; see [DESIGN.md](DESIGN.md) for the rationale and the one
+known remaining divergence this causes.
 
 ## Status
 
-Early development (milestone M3 of 6): M1's decode table, MOVE/MOVEA/MOVEQ,
-LEA, branches, RTS and exception machinery; the M2 ALU families —
-NEG/NEGX/NOT/CLR/TST, Scc/DBcc, ADD/SUB/AND/OR/EOR/CMP (and their address
-forms), ADDX/SUBX/CMPM, and the immediate/CCR/SR logic ops; and the M3
+Early development (milestone M4 of 6, decode/state coverage complete): the
+full `0100`-line instruction set now has handlers — M1's decode table,
+MOVE/MOVEA/MOVEQ, LEA, branches, RTS and exception machinery; the M2 ALU
+families — NEG/NEGX/NOT/CLR/TST, Scc/DBcc, ADD/SUB/AND/OR/EOR/CMP (and their
+address forms), ADDX/SUBX/CMPM, and the immediate/CCR/SR logic ops; the M3
 families — ASx/LSx/ROx/ROXx, BTST/BCHG/BCLR/BSET, MOVEP, ABCD/SBCD/NBCD,
-EXG, and MULU/MULS/DIVU/DIVS. Across the 104 applicable conformance files
-(260,000 cases), unexplained failures are 0; every failure is the single
-documented prefetch gap. Cycle-tier accuracy still trails state tier for a
-handful of read-modify-write and operand-dependent-cost forms (see
-DESIGN.md §5.4/§5.5). Files for not-yet-implemented families are skipped and
-counted.
+EXG, and MULU/MULS/DIVU/DIVS; and M4's remaining system/control
+instructions — CHK, EXT, JMP/JSR, LINK/UNLK, MOVE to/from CCR/SR/USP,
+MOVEM, PEA, RESET, RTE, RTR, STOP, SWAP, TAS, TRAP, TRAPV. All 125
+applicable conformance files (312,500 cases) pass the state tier with 0
+unexplained failures; the only divergence is a 489-case (0.16%) gap in
+MOVE.l/MOVE.w's fault-frame instruction register field, isolated and
+documented (DESIGN.md §5.4). Cycle-tier accuracy still trails state tier for
+a handful of read-modify-write and operand-dependent-cost forms (see
+DESIGN.md §5.5), left for M5.
 
 ## Requirements
 
