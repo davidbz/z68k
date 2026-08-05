@@ -75,6 +75,10 @@ core is generic over the bus type.
 ```zig
 const m68k = @import("m68k");
 
+// FlatBus.ram is []u8, host-owned; addr is u24 so 16 MiB is the max, not a
+// minimum. reset() reads SSP from ram[0..4] and PC from ram[4..8], so both
+// the reset vector and the program need to be loaded before calling it.
+var ram = try allocator.alloc(u8, 16 * 1024 * 1024);
 var bus = m68k.FlatBus{ .ram = ram };   // or any type with read8/16, write8/16
 const Core = m68k.Core(m68k.FlatBus);
 
