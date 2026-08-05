@@ -50,7 +50,14 @@ const implemented = [_][]const u8{
     "EOR.l",    "OR.b",          "OR.w",          "OR.l",     "ANDItoCCR",
     "ANDItoSR", "EORItoCCR",     "EORItoSR",      "ORItoCCR", "ORItoSR",
     "ADDX.b",   "ADDX.w",        "ADDX.l",        "SUBX.b",   "SUBX.w",
-    "SUBX.l",
+    "SUBX.l",   "ASL.b",         "ASL.w",         "ASL.l",    "ASR.b",
+    "ASR.w",    "ASR.l",         "LSL.b",         "LSL.w",    "LSL.l",
+    "LSR.b",    "LSR.w",         "LSR.l",         "ROL.b",    "ROL.w",
+    "ROL.l",    "ROR.b",         "ROR.w",         "ROR.l",    "ROXL.b",
+    "ROXL.w",   "ROXL.l",        "ROXR.b",        "ROXR.w",   "ROXR.l",
+    "BTST",     "BCHG",          "BCLR",          "BSET",     "MOVEP.w",
+    "MOVEP.l",  "ABCD",          "SBCD",          "NBCD",     "EXG",
+    "MULU",     "MULS",          "DIVU",          "DIVS",
 };
 
 fn isImplemented(name: []const u8) bool {

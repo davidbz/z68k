@@ -24,14 +24,14 @@ const EaMode = decode.EaMode;
 /// Aborts the instruction in progress. `step` turns these into exceptions.
 /// Using an error union here rather than a status code keeps every handler's
 /// happy path free of unwinding boilerplate.
-// TODO(M2): Privilege, ZeroDivide and Trap faults, with the instructions that
-// raise them.
+// TODO(M4): the TRAP/CHK/TRAPV faults, with the instructions that raise them.
 pub const Fault = error{
     AddressError,
     IllegalInstruction,
     LineA,
     LineF,
     PrivilegeViolation,
+    ZeroDivide,
 };
 
 pub fn Core(comptime BusT: type) type {
@@ -253,9 +253,11 @@ pub fn Core(comptime BusT: type) type {
         // ----------------------------------------------------------- exceptions
 
         /// Cycle cost of taking an exception (M68000UM exception timing).
-        /// TODO(M2): zero divide (38) and CHK (40) get their own costs.
+        /// TODO(M4): CHK (40) gets its own cost.
         fn exceptionCycles(e: Exception) u8 {
-            return if (e.isGroup0()) 50 else 34;
+            if (e.isGroup0()) return 50;
+            if (e == .zero_divide) return 38;
+            return 34;
         }
 
         pub fn enterException(c: *Cpu, bus: *BusT, e: Exception, g0: ?Group0Info) void {
@@ -395,6 +397,7 @@ pub fn Core(comptime BusT: type) type {
                 Fault.LineA => .line_a,
                 Fault.LineF => .line_f,
                 Fault.PrivilegeViolation => .privilege_violation,
+                Fault.ZeroDivide => .zero_divide,
             };
         }
 
@@ -422,7 +425,7 @@ pub fn Core(comptime BusT: type) type {
                 .rts => try jump(ctx, try pop32(ctx)),
                 .bra, .bsr, .bcc => try opBranch(ctx, op, instr),
 
-                .negx, .clr, .neg, .not, .tst => try opAluSingle(ctx, op, instr),
+                .negx, .clr, .neg, .not, .tst, .nbcd => try opAluSingle(ctx, op, instr),
                 .addq, .subq => try opQuick(ctx, op, instr),
                 .scc => try opScc(ctx, op),
                 .dbcc => try opDbcc(ctx, op),
@@ -432,6 +435,13 @@ pub fn Core(comptime BusT: type) type {
                 .ori_ccr, .ori_sr, .andi_ccr, .andi_sr, .eori_ccr, .eori_sr => try opImmediateSr(ctx, instr),
                 .addx, .subx => try opAddSubX(ctx, op, instr),
                 .cmpm => try opCmpm(ctx, op, instr),
+                .asl, .asr, .lsl, .lsr, .rol, .ror, .roxl, .roxr => try opShift(ctx, op, instr),
+                .btst, .bchg, .bclr, .bset => try opBitOp(ctx, op, instr),
+                .movep => try opMovep(ctx, op, instr),
+                .abcd, .sbcd => try opBcd(ctx, op, instr),
+                .exg => opExg(ctx, op),
+                .mulu, .muls => try opMul(ctx, op, instr),
+                .divu, .divs => try opDiv(ctx, op, instr),
 
                 .line_a => return Fault.LineA,
                 .line_f => return Fault.LineF,
@@ -534,6 +544,10 @@ pub fn Core(comptime BusT: type) type {
                 .negx => .{
                     .value = (0 -% old -% @as(u32, @intFromBool(x_in))) & mask,
                     .cc = flags.subx(0, old, x_in, size, old_z),
+                },
+                .nbcd => blk: {
+                    const r = flags.bcdSub(0, @truncate(old), x_in, old_z);
+                    break :blk .{ .value = r.value, .cc = r.cc };
                 },
                 else => unreachable,
             };
@@ -758,6 +772,70 @@ pub fn Core(comptime BusT: type) type {
             }
         }
 
+        /// MULU/MULS: 16x16 -> 32 into Dn, X unaffected. Dynamic cost is
+        /// `base_cycles` (38) plus 2 per set bit of the source word for
+        /// MULU; MULS instead counts 01/10 bit-pair transitions in the
+        /// source (cheaper for runs of same-value bits, an MC68000 quirk).
+        fn opMul(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            const dn: u3 = @truncate(op >> 9);
+            const ea_mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const ea_reg: u3 = @truncate(op);
+            ctx.cpu.cycles += ea_mode.cycles(.word);
+            const src: u16 = @truncate(try readEa(ctx, ea_mode, ea_reg, .word));
+
+            const value: u32 = if (instr.mnemonic == .muls) blk: {
+                const s: i32 = @as(i16, @bitCast(src));
+                const d: i32 = @as(i16, @bitCast(@as(u16, @truncate(ctx.cpu.d[dn]))));
+                break :blk @bitCast(s *% d);
+            } else @as(u32, src) *% (ctx.cpu.d[dn] & 0xFFFF);
+
+            const transition_bits: u16 = if (instr.mnemonic == .muls) src ^ (src << 1) else src;
+            ctx.cpu.cycles += @as(u64, @popCount(transition_bits)) * 2;
+
+            ctx.cpu.d[dn] = value;
+            ctx.cpu.sr.setNzvc(.{ .n = value & 0x8000_0000 != 0, .z = value == 0 });
+        }
+
+        /// DIVU/DIVS: 32-bit Dn / 16-bit ea -> 16-bit quotient (low word),
+        /// 16-bit remainder (high word), X unaffected. Overflow (quotient
+        /// doesn't fit 16 bits) sets V, clears C, and leaves Dn untouched —
+        /// the value is discarded, not just the flags being "off". Division
+        /// by zero traps rather than computing.
+        fn opDiv(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            const dn: u3 = @truncate(op >> 9);
+            const ea_mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const ea_reg: u3 = @truncate(op);
+            ctx.cpu.cycles += ea_mode.cycles(.word);
+            const src: u16 = @truncate(try readEa(ctx, ea_mode, ea_reg, .word));
+            if (src == 0) return Fault.ZeroDivide;
+
+            if (instr.mnemonic == .divu) {
+                const dividend = ctx.cpu.d[dn];
+                const divisor: u32 = src;
+                const quotient = dividend / divisor;
+                if (quotient > 0xFFFF) {
+                    ctx.cpu.sr.setNzvc(.{ .v = true, .n = true });
+                    return;
+                }
+                const remainder = dividend % divisor;
+                ctx.cpu.d[dn] = (remainder << 16) | quotient;
+                ctx.cpu.sr.setNzvc(.{ .n = quotient & 0x8000 != 0, .z = quotient == 0 });
+            } else {
+                const dividend: i32 = @bitCast(ctx.cpu.d[dn]);
+                const divisor: i32 = @as(i16, @bitCast(src));
+                const quotient = @divTrunc(dividend, divisor);
+                if (quotient > 32767 or quotient < -32768) {
+                    ctx.cpu.sr.setNzvc(.{ .v = true, .n = true });
+                    return;
+                }
+                const remainder = @rem(dividend, divisor);
+                const q16: u16 = @bitCast(@as(i16, @truncate(quotient)));
+                const r16: u16 = @bitCast(@as(i16, @truncate(remainder)));
+                ctx.cpu.d[dn] = (@as(u32, r16) << 16) | q16;
+                ctx.cpu.sr.setNzvc(.{ .n = quotient < 0, .z = quotient == 0 });
+            }
+        }
+
         /// ORI/ANDI/SUBI/ADDI/EORI/CMPI: immediate always the source, `ea` the
         /// destination (Dn or memory), except CMPI which only reads `ea` and
         /// discards the result. `write=false` in `calcEa` matches the RMW
@@ -911,6 +989,64 @@ pub fn Core(comptime BusT: type) type {
             ctx.cpu.sr.setNzvcx(cc);
         }
 
+        /// ABCD/SBCD: byte-only, register or -(Ay),-(Ax) pair form — same
+        /// shape ADDX/SUBX use, minus the long-size predecrement-pair special
+        /// case above since these never go past byte.
+        fn opBcd(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            const rx: u3 = @truncate(op >> 9);
+            const ry: u3 = @truncate(op);
+            const mem_form = op & 0x0008 != 0;
+
+            const old_z = ctx.cpu.sr.z;
+            const x_in = ctx.cpu.sr.x;
+
+            var dst_addr: u32 = undefined;
+            var src: u8 = undefined;
+            var dst: u8 = undefined;
+            if (mem_form) {
+                const src_addr = try calcEa(ctx, .addr_predec, ry, .byte, false);
+                src = @truncate(try readAt(ctx, src_addr, .byte, false));
+                dst_addr = try calcEa(ctx, .addr_predec, rx, .byte, true);
+                dst = @truncate(try readAt(ctx, dst_addr, .byte, false));
+            } else {
+                src = @truncate(ctx.cpu.d[ry]);
+                dst = @truncate(ctx.cpu.d[rx]);
+            }
+
+            const r = if (instr.mnemonic == .abcd)
+                flags.bcdAdd(dst, src, x_in, old_z)
+            else
+                flags.bcdSub(dst, src, x_in, old_z);
+
+            if (mem_form) {
+                try writeAt(ctx, dst_addr, .byte, r.value);
+            } else {
+                setReg(&ctx.cpu.d[rx], .byte, r.value);
+            }
+            ctx.cpu.sr.setNzvcx(r.cc);
+        }
+
+        /// EXG: swaps two full 32-bit registers, no flags affected. The
+        /// 5-bit mode field (bits 7-3) picks which register file each side
+        /// comes from; Dx,Ay swaps across the D/A files, the other two forms
+        /// stay within one.
+        fn opExg(ctx: *Ctx, op: u16) void {
+            const rx: u3 = @truncate(op >> 9);
+            const ry: u3 = @truncate(op);
+            const exg_mode: u5 = @truncate(op >> 3);
+            const px = switch (exg_mode) {
+                0b01001 => &ctx.cpu.a[rx],
+                else => &ctx.cpu.d[rx],
+            };
+            const py = switch (exg_mode) {
+                0b01000 => &ctx.cpu.d[ry],
+                else => &ctx.cpu.a[ry],
+            };
+            const tmp = px.*;
+            px.* = py.*;
+            py.* = tmp;
+        }
+
         /// CMPM: (Ay)+,(Ax)+ — both operands postincrement independently, no
         /// writeback, source read before destination. The destination read
         /// passes `write=true` to `calcEa` even though nothing is written
@@ -949,6 +1085,150 @@ pub fn Core(comptime BusT: type) type {
             const dst = try readAt(ctx, dst_addr, size, false);
 
             ctx.cpu.sr.setNzvc(flags.sub(dst, src, size));
+        }
+
+        fn shiftKind(mn: decode.Mnemonic) flags.ShiftKind {
+            return switch (mn) {
+                .asl => .asl,
+                .asr => .asr,
+                .lsl => .lsl,
+                .lsr => .lsr,
+                .rol => .rol,
+                .ror => .ror,
+                .roxl => .roxl,
+                .roxr => .roxr,
+                else => unreachable,
+            };
+        }
+
+        /// ASx/LSx/ROx/ROXx. The register form's i/r bit (5) picks whether
+        /// the count is the encoded immediate (1-8, 0 means 8) or a
+        /// register's value (mod 64, free via truncation to u6). The memory
+        /// form always shifts exactly one bit and has no count field.
+        fn opShift(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            const kind = shiftKind(instr.mnemonic);
+            const x_in = ctx.cpu.sr.x;
+
+            const is_memory = (op >> 6) & 0b11 == 0b11;
+            if (is_memory) {
+                const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+                const reg: u3 = @truncate(op);
+                ctx.cpu.cycles += mode.destCycles(.word);
+                const addr = try calcEa(ctx, mode, reg, .word, false);
+                const old = try readAt(ctx, addr, .word, false);
+                const r = flags.shift(kind, old, 1, .word, x_in);
+                try writeAt(ctx, addr, .word, r.value);
+                ctx.cpu.sr.setNzvc(.{ .n = r.n, .z = r.z, .v = r.v, .c = r.c });
+                if (r.x) |x| ctx.cpu.sr.x = x;
+                return;
+            }
+
+            const size = instr.size;
+            const dn: u3 = @truncate(op);
+            const count: u6 = if (op & 0x0020 != 0) blk: {
+                const creg: u3 = @truncate(op >> 9);
+                break :blk @truncate(ctx.cpu.d[creg]);
+            } else blk: {
+                const field: u3 = @truncate(op >> 9);
+                break :blk if (field == 0) 8 else field;
+            };
+            ctx.cpu.cycles += @as(u64, count) * 2;
+
+            const old = ctx.cpu.d[dn] & size.mask();
+            const r = flags.shift(kind, old, count, size, x_in);
+            setReg(&ctx.cpu.d[dn], size, r.value);
+            ctx.cpu.sr.setNzvc(.{ .n = r.n, .z = r.z, .v = r.v, .c = r.c });
+            if (r.x) |x| ctx.cpu.sr.x = x;
+        }
+
+        /// BTST/BCHG/BCLR/BSET. The bit number is a runtime value either way
+        /// (an extension word for the static form, Dn for the dynamic one),
+        /// so decode couldn't split them; bit 8 does it here too.
+        fn opBitOp(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const reg: u3 = @truncate(op);
+
+            const bit_num: u32 = if (op & 0x0100 == 0)
+                try fetch16(ctx) & 0xFF
+            else
+                ctx.cpu.d[@as(u3, @truncate(op >> 9))];
+
+            // Dn: bit# mod 32, tests/writes the whole register.
+            if (mode == .data_reg) {
+                const bit: u5 = @truncate(bit_num);
+                // Hardware quirk: touching the upper word of the register
+                // costs 2 more cycles than the lower one — BCHG/BCLR/BSET
+                // only (BTST never writes back, so it skips the extra access).
+                if (instr.mnemonic != .btst and bit >= 16) ctx.cpu.cycles += 2;
+                const mask: u32 = @as(u32, 1) << bit;
+                const old = ctx.cpu.d[reg];
+                ctx.cpu.sr.z = old & mask == 0;
+                const v: u32 = switch (instr.mnemonic) {
+                    .btst => old,
+                    .bchg => old ^ mask,
+                    .bclr => old & ~mask,
+                    .bset => old | mask,
+                    else => unreachable,
+                };
+                if (instr.mnemonic != .btst) setReg(&ctx.cpu.d[reg], .long, v);
+                return;
+            }
+
+            // Memory: bit# mod 8, always a single byte. Only BTST's ea class
+            // allows immediate, which (unlike every other mode) has no
+            // address to compute — read the ext word directly instead.
+            const bit: u3 = @truncate(bit_num);
+            const mask: u8 = @as(u8, 1) << bit;
+            if (mode == .immediate) {
+                // BTST's one genuinely odd case: testing a bit in a literal
+                // costs 2 more than an ordinary byte immediate fetch
+                // (confirmed against SST cycle data).
+                ctx.cpu.cycles += mode.cycles(.byte) + 2;
+                const old: u8 = @truncate(try fetch16(ctx));
+                ctx.cpu.sr.z = old & mask == 0;
+                return;
+            }
+
+            // Bit ops' ea timing table matches the general (source) cost, not
+            // the RMW destination one: -(An) still pays the full 6, unlike
+            // CLR/NEG/NOT next door (confirmed against SST cycle data).
+            ctx.cpu.cycles += mode.cycles(.byte);
+            const addr = try calcEa(ctx, mode, reg, .byte, false);
+            const old: u8 = @truncate(try readAt(ctx, addr, .byte, mode.isProgram()));
+            ctx.cpu.sr.z = old & mask == 0;
+            if (instr.mnemonic == .btst) return;
+            const v: u8 = switch (instr.mnemonic) {
+                .bchg => old ^ mask,
+                .bclr => old & ~mask,
+                .bset => old | mask,
+                else => unreachable,
+            };
+            try writeAt(ctx, addr, .byte, v);
+        }
+
+        /// MOVEP: alternates bytes of Dn (high first) with word-spaced bytes
+        /// of memory starting at d16(An). Bit 7 picks direction; size lives
+        /// in `instr.size`.
+        fn opMovep(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            const dn: u3 = @truncate(op >> 9);
+            const an: u3 = @truncate(op);
+            const to_mem = op & 0x0080 != 0;
+            const d: i16 = @bitCast(try fetch16(ctx));
+            const base = ctx.cpu.a[an] +% @as(u32, @bitCast(@as(i32, d)));
+
+            const n: u32 = if (instr.size == .long) 4 else 2;
+            if (to_mem) {
+                var i: u32 = 0;
+                while (i < n) : (i += 1) {
+                    const shift: u5 = @intCast((n - 1 - i) * 8);
+                    write8(ctx, base +% i * 2, @truncate(ctx.cpu.d[dn] >> shift));
+                }
+            } else {
+                var v: u32 = 0;
+                var i: u32 = 0;
+                while (i < n) : (i += 1) v = (v << 8) | read8(ctx, base +% i * 2);
+                setReg(&ctx.cpu.d[dn], instr.size, v);
+            }
         }
 
         fn opMoveq(ctx: *Ctx, op: u16) void {

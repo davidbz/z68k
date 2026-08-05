@@ -13,14 +13,16 @@ divergence this causes.
 
 ## Status
 
-Early development (milestone M2 of 6): M1's decode table, MOVE/MOVEA/MOVEQ,
-LEA, branches, RTS and exception machinery, plus the ALU families —
+Early development (milestone M3 of 6): M1's decode table, MOVE/MOVEA/MOVEQ,
+LEA, branches, RTS and exception machinery; the M2 ALU families —
 NEG/NEGX/NOT/CLR/TST, Scc/DBcc, ADD/SUB/AND/OR/EOR/CMP (and their address
-forms), ADDX/SUBX/CMPM, and the immediate/CCR/SR logic ops. Across the 66
-applicable conformance files (165,000 cases), unexplained failures are 0;
-every failure is the single documented prefetch gap. Cycle-tier accuracy
-still trails state tier for a handful of read-modify-write forms (see
-DESIGN.md §5.4). Files for not-yet-implemented families are skipped and
+forms), ADDX/SUBX/CMPM, and the immediate/CCR/SR logic ops; and the M3
+families — ASx/LSx/ROx/ROXx, BTST/BCHG/BCLR/BSET, MOVEP, ABCD/SBCD/NBCD,
+EXG, and MULU/MULS/DIVU/DIVS. Across the 104 applicable conformance files
+(260,000 cases), unexplained failures are 0; every failure is the single
+documented prefetch gap. Cycle-tier accuracy still trails state tier for a
+handful of read-modify-write and operand-dependent-cost forms (see
+DESIGN.md §5.4/§5.5). Files for not-yet-implemented families are skipped and
 counted.
 
 ## Requirements

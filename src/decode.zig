@@ -233,7 +233,18 @@ pub fn decodeOne(op: u16) Instr {
             0x027C => .{ .mnemonic = .andi_sr, .size = .word, .base_cycles = 20 },
             0x0A3C => .{ .mnemonic = .eori_ccr, .size = .byte, .base_cycles = 20 },
             0x0A7C => .{ .mnemonic = .eori_sr, .size = .word, .base_cycles = 20 },
-            else => decodeImmediateAlu(op, mode, reg),
+            else => blk: {
+                // Static bit op: 0000 1000 oo mmm rrr, bit# in the ext word.
+                if (op & 0xFF00 == 0x0800) break :blk decodeBitOp(op, mode, reg, true);
+                // Dynamic bit op / MOVEP: 0000 ddd1 oo mmm rrr. MOVEP always
+                // has mode=001 (An direct), which a bit op's ea can never be
+                // (An isn't in `ea_data`), so the two never collide.
+                if (op & 0x0100 != 0) {
+                    if (mode == 1) break :blk decodeMovep(op);
+                    break :blk decodeBitOp(op, mode, reg, false);
+                }
+                break :blk decodeImmediateAlu(op, mode, reg);
+            },
         },
 
         0b0001, 0b0011, 0b0010 => decodeMove(op),
@@ -266,6 +277,19 @@ pub fn decodeOne(op: u16) Instr {
                     };
                 }
 
+                // NBCD: 0100 1000 00 mmm rrr, byte-only BCD negate. Its own
+                // fixed slot at the 0x48 nibble's ss=00; ss=01 there is
+                // SWAP/PEA instead (still TODO(M4)).
+                if (op & 0xFFC0 == 0x4800) {
+                    const ea = EaMode.decode(mode, reg) orelse break :blk illegal;
+                    if (!ea_data_alterable.contains(ea)) break :blk illegal;
+                    break :blk .{
+                        .mnemonic = .nbcd,
+                        .size = .byte,
+                        .base_cycles = if (ea == .data_reg) @as(u8, 6) else 8,
+                    };
+                }
+
                 // Single-operand ALU forms: NEGX/CLR/NEG/NOT/TST, all shaped
                 // 0100 oooo ssmmmrrr. Everything else on this line (TRAP, CHK,
                 // JSR, JMP, PEA, LINK, MOVEM, ...) is TODO(M4).
@@ -279,8 +303,8 @@ pub fn decodeOne(op: u16) Instr {
                 };
                 if (mn) |m| {
                     const size_field: u2 = @truncate(op >> 6);
-                    // size 11 is a reserved slot here (NBCD under negx's
-                    // prefix, TAS under tst's) — not this family, TODO(M3+).
+                    // size 11 is a reserved slot here: TAS under tst's
+                    // prefix — not this family, TODO(M3+).
                     if (size_field == 0b11) break :blk illegal;
                     const size: Size = @enumFromInt(size_field);
                     const ea = EaMode.decode(mode, reg) orelse break :blk illegal;
@@ -356,12 +380,12 @@ pub fn decodeOne(op: u16) Instr {
 
         // OR/SUB/AND/ADD share one shape: 1oo0 rrr ooo mmm rrr, where the
         // 3-bit opmode (bits 8-6) picks byte/word/long "er" (ea op Dn -> Dn,
-        // 0-2), the A-form (ea -> An, 3 word / 7 long — not present for AND,
-        // whose slots 3/7 are MULU/MULS instead, TODO(M3)), or byte/word/long
-        // "re" (Dn op ea -> ea, memory only, 4-6).
-        0b1000 => decodeAluLine(op, mode, reg, .or_, .or_, null, null),
+        // 0-2), the A-form (ea -> An, 3 word / 7 long — AND/OR use those
+        // slots for MULU/MULS and DIVU/DIVS instead, see `decodeAndOrLine`),
+        // or byte/word/long "re" (Dn op ea -> ea, memory only, 4-6).
+        0b1000 => decodeAndOrLine(op, mode, reg, .or_, .sbcd, null, .divu, .divs),
         0b1001 => decodeAluLine(op, mode, reg, .sub, .sub, .suba, .subx),
-        0b1100 => decodeAluLine(op, mode, reg, .and_, .and_, null, null),
+        0b1100 => decodeAndOrLine(op, mode, reg, .and_, .abcd, .exg, .mulu, .muls),
         0b1101 => decodeAluLine(op, mode, reg, .add, .add, .adda, .addx),
 
         // CMP/CMPA/EOR share the 1011 line the same way, except CMP has no
@@ -408,9 +432,8 @@ pub fn decodeOne(op: u16) Instr {
             }
         },
 
-        // TODO(M3): 1110 (shift/rotate), and the dynamic/static bit ops and
-        // MOVEP still sharing the 0000 line's 0x08/0x0E/0x0F sub-groups (see
-        // decodeImmediateAlu). See DESIGN.md §4.8.
+        0b1110 => decodeShift(op, mode, reg),
+
         // Instructions whose whole job is to raise an exception cost nothing on
         // their own: the vector's entry time already covers the opcode fetch.
         0b1010 => .{ .mnemonic = .line_a },
@@ -419,10 +442,11 @@ pub fn decodeOne(op: u16) Instr {
     };
 }
 
-/// OR/SUB/AND/ADD: 1oo0 rrr ooo mmm rrr. `a_mn` is `null` for AND, whose
-/// A-form slots are MULU/MULS instead (TODO(M3)). `x_mn` is `.addx`/`.subx`
-/// for the ADD/SUB lines, `null` for AND/OR (whose reserved slots here are
-/// ABCD/SBCD/EXG instead, TODO(M3)): ADDX/SUBX share the re-direction's
+/// OR/SUB/AND/ADD: 1oo0 rrr ooo mmm rrr. `a_mn` is `null` for AND/OR, whose
+/// A-form slots are MULU/MULS and DIVU/DIVS instead (see `decodeAndOrLine`).
+/// `x_mn` is `.addx`/`.subx` for the ADD/SUB lines, `null` for AND/OR (whose
+/// reserved slots here are ABCD/SBCD/EXG instead): ADDX/SUBX share the
+/// re-direction's
 /// byte/word/long opmodes, distinguished from a normal memory destination by
 /// `ea` decoding as `data_reg` (register-register form, bit 3 of the raw
 /// opcode clear) or `addr_reg` (the `-(Ay),-(Ax)` memory-pair form, bit 3
@@ -458,11 +482,137 @@ fn decodeAluLine(op: u16, mode: u3, reg: u3, er_mn: Mnemonic, re_mn: Mnemonic, a
     };
 }
 
+/// AND/OR's byte re-direction opmode (100) doubles as ABCD/SBCD's home: `ea`
+/// decoding as `data_reg` is the Dy,Dx register form, `addr_reg` the
+/// -(Ay),-(Ax) memory-pair form — same reserved-encoding trick `decodeAluLine`
+/// uses for ADDX/SUBX, but ABCD/SBCD is byte-only (no word/long counterpart)
+/// and costs more for the register form (6, not 4), so it gets its own
+/// pre-check rather than another `decodeAluLine` parameter.
+///
+/// `exg_mn` is `.exg` on the AND line only: EXG's 5-bit mode field (bits
+/// 7-3) is 01000/01001/10001 (Dx,Dy / Ax,Ay / Dx,Ay), with bit 8 always set
+/// to mark the family. Checking bit 8 matters: without it the mode field
+/// alone collides with ordinary word-form AND/OR opmodes (bits 8-6 = 001),
+/// whose low 3 EA-mode bits can coincidentally match 01000's low 3 bits.
+///
+/// `u_mn`/`s_mn` (unsigned/signed MULU|DIVU vs MULS|DIVS) take opmodes 3/7,
+/// the same slots ADDA/SUBA use on the other ALU lines — but unlike
+/// ADDA/SUBA (same mnemonic, word vs long) the AND/OR lines use two
+/// different mnemonics both at a fixed word size, and unlike ADDA/CMPA the
+/// source excludes An direct (`ea_data`, not `ea_all`), so this can't reuse
+/// `decodeAluLine`'s `a_mn`. The word-count-dependent part of MULU/MULS's
+/// cost and DIVU/DIVS's dividend-dependent cost are runtime-only;
+/// `base_cycles` here is just the fixed floor the handler adds to.
+fn decodeAndOrLine(op: u16, mode: u3, reg: u3, mn: Mnemonic, bcd_mn: Mnemonic, exg_mn: ?Mnemonic, u_mn: Mnemonic, s_mn: Mnemonic) Instr {
+    if (exg_mn) |em| {
+        const exg_mode: u5 = @truncate(op >> 3);
+        if (op & 0x0100 != 0 and (exg_mode == 0b01000 or exg_mode == 0b01001 or exg_mode == 0b10001)) {
+            return .{ .mnemonic = em, .size = .long, .base_cycles = 6 };
+        }
+    }
+    const opmode: u3 = @truncate(op >> 6);
+    if (opmode == 0b100) {
+        const ea = EaMode.decode(mode, reg) orelse return illegal;
+        if (ea == .data_reg or ea == .addr_reg) {
+            return .{ .mnemonic = bcd_mn, .size = .byte, .base_cycles = if (ea == .data_reg) @as(u8, 6) else 18 };
+        }
+    }
+    if (opmode == 0b011 or opmode == 0b111) {
+        const ea = EaMode.decode(mode, reg) orelse return illegal;
+        if (!ea_data.contains(ea)) return illegal;
+        const is_signed = opmode == 0b111;
+        return .{
+            .mnemonic = if (is_signed) s_mn else u_mn,
+            .size = .word,
+            .base_cycles = if (mn == .and_) @as(u8, 38) else @as(u8, 140),
+        };
+    }
+    return decodeAluLine(op, mode, reg, mn, mn, null, null);
+}
+
+fn shiftMnemonic(ty: u2, left: bool) Mnemonic {
+    return switch (ty) {
+        0 => if (left) .asl else .asr,
+        1 => if (left) .lsl else .lsr,
+        2 => if (left) .roxl else .roxr,
+        3 => if (left) .rol else .ror,
+    };
+}
+
+/// ASx/LSx/ROx/ROXx: 1110 ccccc dss iii rrr for the register/immediate-count
+/// form (size field 00/01/10 = byte/word/long, count/type in bits 11-9 and
+/// 4-3). Size field 11 is repurposed as the memory form's marker: the type
+/// field moves to bits 11-9 and the usual mode/reg pair becomes an EA (word
+/// only, one bit at a time, memory-alterable — same destination class as
+/// CLR/NEG, no Dn/An).
+fn decodeShift(op: u16, mode: u3, reg: u3) Instr {
+    const size_field: u2 = @truncate(op >> 6);
+    const left = op & 0x0100 != 0;
+
+    if (size_field == 0b11) {
+        const ea = EaMode.decode(mode, reg) orelse return illegal;
+        if (!ea_memory_alterable.contains(ea)) return illegal;
+        const ty: u2 = @truncate(op >> 9);
+        return .{ .mnemonic = shiftMnemonic(ty, left), .size = .word, .base_cycles = 8 };
+    }
+
+    const size: Size = @enumFromInt(size_field);
+    const ty: u2 = @truncate(op >> 3);
+    return .{
+        .mnemonic = shiftMnemonic(ty, left),
+        .size = size,
+        // The shift count (immediate, or at runtime a register's value) adds
+        // 2 cycles each; the handler applies that on top of this fixed base.
+        .base_cycles = if (size == .long) @as(u8, 8) else 6,
+    };
+}
+
+/// BTST/BCHG/BCLR/BSET, static (`#imm` bit number, an extension word fetched
+/// at runtime) or dynamic (bit number in the ddd field's Dn). Either way the
+/// bit number is a runtime value, so decode only picks mnemonic/ea/cost; the
+/// handler does the mod-32-vs-mod-8 split once it knows whether `ea` is a Dn.
+/// BTST never writes back, so unlike the other three it keeps `ea_data`'s
+/// read-only forms (PC-relative, immediate) per the M68000 PRM's addressing
+/// table for this family.
+fn decodeBitOp(op: u16, mode: u3, reg: u3, static: bool) Instr {
+    const sel: u2 = @truncate(op >> 6);
+    const mn: Mnemonic = switch (sel) {
+        0 => .btst,
+        1 => .bchg,
+        2 => .bclr,
+        3 => .bset,
+    };
+
+    const ea = EaMode.decode(mode, reg) orelse return illegal;
+    const allowed = if (mn == .btst) ea_data else ea_data_alterable;
+    if (!allowed.contains(ea)) return illegal;
+
+    const is_dn = ea == .data_reg;
+    // M68000UM Table 3-19: register destination is cheaper than memory, and
+    // the static forms pay 4 extra cycles to fetch the bit-number ext word.
+    const base_cycles: u8 = switch (mn) {
+        .btst => if (is_dn) (if (static) @as(u8, 10) else 6) else (if (static) @as(u8, 8) else 4),
+        .bclr => if (is_dn) (if (static) @as(u8, 12) else 8) else (if (static) @as(u8, 12) else 8),
+        .bchg, .bset => if (is_dn) (if (static) @as(u8, 10) else 6) else (if (static) @as(u8, 12) else 8),
+        else => unreachable,
+    };
+    return .{ .mnemonic = mn, .size = .byte, .base_cycles = base_cycles };
+}
+
+/// MOVEP: 0000 ddd1 oo 001 aaa, transfers 2 or 4 bytes between Dn and
+/// alternating bytes of memory at d16(An). Size/direction live in the two
+/// `oo` bits (00/01 = word/long from memory, 10/11 = word/long to memory);
+/// the handler re-reads them from `op` since `Instr` has no direction field.
+fn decodeMovep(op: u16) Instr {
+    const oo: u2 = @truncate(op >> 6);
+    const size: Size = if (oo & 1 != 0) .long else .word;
+    return .{ .mnemonic = .movep, .size = size, .base_cycles = if (size == .long) 24 else 16 };
+}
+
 /// ORI/ANDI/SUBI/ADDI/EORI/CMPI: 0000 oooo ss mmm rrr. The immediate operand
 /// is always the source; `ea` (Dn or alterable memory, no An/PC-relative,
 /// same class NEG/CLR/TST already use) is the destination, except for CMPI
-/// which only reads it. 0x08's dynamic bit-op prefix falls through to
-/// illegal here (TODO(M3)).
+/// which only reads it.
 fn decodeImmediateAlu(op: u16, mode: u3, reg: u3) Instr {
     const size_field: u2 = @truncate(op >> 6);
     if (size_field == 0b11) return illegal;
