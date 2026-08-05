@@ -69,6 +69,62 @@ pub fn subx(a: u32, b: u32, x_in: bool, size: Size, old_z: bool) Ccr {
     return .{ .n = rn, .z = result == 0 and old_z, .v = v, .c = borrow, .x = borrow };
 }
 
+/// Packed-BCD add/sub result: N and V are famously "undefined" per the
+/// Motorola manual, but ABCD/SBCD/NBCD conformance data pins down exactly
+/// what real hardware does, so it's reproduced verbatim (via Musashi's
+/// widely cross-checked port of it) rather than left to guesswork. Z follows
+/// ADDX/SUBX's sticky convention: only ever cleared, letting a multi-byte BCD
+/// chain read as zero solely when every byte in it was zero.
+pub const BcdResult = struct { value: u8, cc: Ccr };
+
+/// ABCD: `a + b + x`, corrected one decimal digit at a time. V is set exactly
+/// when the decimal correction flips the result negative that the plain binary
+/// `a +% b +% x` wasn't (the classic 6800-family DAA quirk) — confirmed bit
+/// for bit against conformance data, not derivable from the manual.
+pub fn bcdAdd(a: u8, b: u8, x_in: bool, old_z: bool) BcdResult {
+    const a16: u16 = a;
+    const b16: u16 = b;
+    var res: u16 = (a16 & 0xF) +% (b16 & 0xF) +% @intFromBool(x_in);
+    if (res > 9) res +%= 6;
+    res +%= (a16 & 0xF0) +% (b16 & 0xF0);
+    const carry = res > 0x9F;
+    if (carry) res -%= 0xA0;
+    const value: u8 = @truncate(res);
+    const raw = a +% b +% @as(u8, @intFromBool(x_in));
+    return .{
+        .value = value,
+        .cc = .{ .n = res & 0x80 != 0, .z = value == 0 and old_z, .v = res & 0x80 != 0 and raw & 0x80 == 0, .c = carry, .x = carry },
+    };
+}
+
+/// SBCD: `a - b - x`, corrected against the plain binary subtraction (unlike
+/// `bcdAdd`, which corrects a nibble-built intermediate). The value's high
+/// correction (0x60) is gated on the raw unsigned byte borrow (`a < b + x`).
+/// The C/X output is a *different*, more inclusive condition than that value
+/// correction: it also fires when `a == b + x` exactly (raw == 0) but a low
+/// nibble borrow still occurs — real hardware reports a carry-out there even
+/// though the raw byte compare shows no borrow. Confirmed against
+/// conformance data (register- and memory-form); not derivable from the
+/// manual. V mirrors `bcdAdd`'s quirk in the other direction: set when the
+/// correction pulls a negative raw subtraction back to non-negative.
+pub fn bcdSub(a: u8, b: u8, x_in: bool, old_z: bool) BcdResult {
+    const x: u8 = @intFromBool(x_in);
+    const raw = a -% b -% x;
+    const low_borrow = (a & 0xF) < (b & 0xF) + x;
+    const full_borrow = @as(u16, a) < @as(u16, b) + x;
+    var corf: u8 = 0;
+    if (low_borrow) corf +%= 6;
+    if (full_borrow) corf +%= 0x60;
+    const value = raw -% corf;
+    const corf_low: i16 = if (low_borrow) 6 else 0;
+    const a_wide: i16 = @as(i16, a) - @as(i16, b) - x;
+    const carry = a_wide < corf_low;
+    return .{
+        .value = value,
+        .cc = .{ .n = value & 0x80 != 0, .z = value == 0 and old_z, .v = raw & 0x80 != 0 and value & 0x80 == 0, .c = carry, .x = carry },
+    };
+}
+
 /// The 16 condition codes, shared by Bcc, Scc and DBcc.
 pub fn testCondition(sr: cpu.StatusRegister, cond: u4) bool {
     return switch (cond) {
@@ -91,8 +147,134 @@ pub fn testCondition(sr: cpu.StatusRegister, cond: u4) bool {
     };
 }
 
-// TODO(M3): shift/rotate flags (ASx/LSx/ROx/ROXx). Their C/X/V rules differ per
-// variant and at count 0, so they get their own functions and their own tests.
+/// The eight shift/rotate variants, sharing one implementation since they
+/// differ only in which bit feeds in and whether X participates.
+pub const ShiftKind = enum { asl, asr, lsl, lsr, rol, ror, roxl, roxr };
+
+pub const ShiftResult = struct {
+    value: u32,
+    n: bool,
+    z: bool,
+    v: bool,
+    c: bool,
+    /// `null` means "leave X alone": ROL/ROR never touch it, and ASx/LSx
+    /// don't either at count 0 (only C is cleared then — a real hardware
+    /// asymmetry with the count>0 case, where X mirrors C).
+    x: ?bool,
+};
+
+/// Shifts/rotates one bit at a time, `count` times — matching the real
+/// microcode (and its 2-cycles-per-count cost) rather than a closed-form
+/// bit-twiddle, which would have to special-case ASL's V flag anyway (set if
+/// the sign bit's value changes on *any* individual step, not just start vs
+/// end).
+pub fn shift(kind: ShiftKind, value: u32, count: u6, size: Size, x_in: bool) ShiftResult {
+    const mask = size.mask();
+    var v = value & mask;
+
+    if (count == 0) {
+        // Only ROX kinds still reflect X in C at count 0 (the rotate ring
+        // includes X, so "no rotation" leaves C = X); every other kind
+        // clears C outright. X itself is never touched by a count-0 shift.
+        return .{
+            .value = v,
+            .n = isNeg(v, size),
+            .z = v == 0,
+            .v = false,
+            .c = switch (kind) {
+                .roxl, .roxr => x_in,
+                else => false,
+            },
+            .x = null,
+        };
+    }
+
+    const msb = size.msb();
+    var carry: bool = x_in;
+    var overflow = false;
+
+    switch (kind) {
+        .asl => {
+            var i: u6 = 0;
+            while (i < count) : (i += 1) {
+                const before = v & msb != 0;
+                carry = before;
+                v = (v << 1) & mask;
+                if (before != (v & msb != 0)) overflow = true;
+            }
+        },
+        .lsl => {
+            var i: u6 = 0;
+            while (i < count) : (i += 1) {
+                carry = v & msb != 0;
+                v = (v << 1) & mask;
+            }
+        },
+        .asr => {
+            const sign = v & msb != 0;
+            var i: u6 = 0;
+            while (i < count) : (i += 1) {
+                carry = v & 1 != 0;
+                v = ((v >> 1) | (if (sign) msb else 0)) & mask;
+            }
+        },
+        .lsr => {
+            var i: u6 = 0;
+            while (i < count) : (i += 1) {
+                carry = v & 1 != 0;
+                v = (v >> 1) & mask;
+            }
+        },
+        .rol => {
+            var i: u6 = 0;
+            while (i < count) : (i += 1) {
+                const out = v & msb != 0;
+                v = ((v << 1) | @intFromBool(out)) & mask;
+                carry = out;
+            }
+        },
+        .ror => {
+            var i: u6 = 0;
+            while (i < count) : (i += 1) {
+                const out = v & 1 != 0;
+                v = ((v >> 1) | (if (out) msb else 0)) & mask;
+                carry = out;
+            }
+        },
+        .roxl => {
+            var x = x_in;
+            var i: u6 = 0;
+            while (i < count) : (i += 1) {
+                const out = v & msb != 0;
+                v = ((v << 1) | @intFromBool(x)) & mask;
+                x = out;
+            }
+            carry = x;
+        },
+        .roxr => {
+            var x = x_in;
+            var i: u6 = 0;
+            while (i < count) : (i += 1) {
+                const out = v & 1 != 0;
+                v = ((v >> 1) | (if (x) msb else 0)) & mask;
+                x = out;
+            }
+            carry = x;
+        },
+    }
+
+    return .{
+        .value = v,
+        .n = isNeg(v, size),
+        .z = v == 0,
+        .v = overflow,
+        .c = carry,
+        .x = switch (kind) {
+            .rol, .ror => null,
+            else => carry,
+        },
+    };
+}
 
 test "condition codes" {
     const eq = cpu.StatusRegister{ .z = true };
@@ -163,4 +345,52 @@ test "addx/subx accumulate Z across a chain, never set it back" {
     // subx borrow chain: 0 - 0 - x_in(1) borrows.
     const b = subx(0, 0, true, .byte, true);
     try std.testing.expect(b.c and b.x and !b.z);
+}
+
+test "shift: count 0 clears C (and, for ROX, mirrors X) but never touches X itself" {
+    const asl0 = shift(.asl, 0x12, 0, .byte, true);
+    try std.testing.expect(!asl0.c and asl0.x == null and asl0.value == 0x12);
+
+    const roxl0 = shift(.roxl, 0, 0, .byte, true);
+    try std.testing.expect(roxl0.c and roxl0.x == null); // C mirrors X, X itself untouched
+}
+
+test "shift: asl sets V when the sign bit changes mid-shift, C/X to the last bit out" {
+    // 0x40 << 1 = 0x80: crosses from positive to negative mid-shift.
+    const cross = shift(.asl, 0x40, 1, .byte, false);
+    try std.testing.expect(cross.v and cross.n and !cross.c);
+    try std.testing.expectEqual(@as(bool, false), cross.x.?);
+
+    // 0xC0 << 1 = 0x80: stays negative throughout, no overflow.
+    const stay = shift(.asl, 0xC0, 1, .byte, false);
+    try std.testing.expect(!stay.v and stay.c); // bit shifted out (bit7=1) is the carry
+}
+
+test "shift: asr sign-extends and never sets V" {
+    const r = shift(.asr, 0x80, 4, .byte, false);
+    try std.testing.expectEqual(@as(u32, 0xF8), r.value);
+    try std.testing.expect(!r.v);
+}
+
+test "shift: rol/ror never write X even at count > 0" {
+    const r = shift(.rol, 0x80, 1, .byte, false);
+    try std.testing.expectEqual(@as(u32, 0x01), r.value);
+    try std.testing.expect(r.c and r.x == null);
+}
+
+test "shift: roxl rotates X into the vacated bit and back out the other end" {
+    // 0x00 rotated left through X=1: bit0 becomes 1, X becomes the old bit7 (0).
+    const r = shift(.roxl, 0x00, 1, .byte, true);
+    try std.testing.expectEqual(@as(u32, 0x01), r.value);
+    try std.testing.expect(!r.c and r.x.? == false);
+}
+
+test "shift: lsr/lsl clear V and shift in zero" {
+    const l = shift(.lsl, 0xFF, 1, .byte, false);
+    try std.testing.expectEqual(@as(u32, 0xFE), l.value);
+    try std.testing.expect(l.c and !l.v);
+
+    const r = shift(.lsr, 0x01, 1, .byte, false);
+    try std.testing.expectEqual(@as(u32, 0x00), r.value);
+    try std.testing.expect(r.c and r.z);
 }

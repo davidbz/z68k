@@ -605,7 +605,7 @@ what M4 is for.
 |---|---|---|
 | M1 | decode table, MOVE/MOVEA/MOVEQ, harness runs | MOVE* files pass state tier |
 | M2 | ALU families + flags | arithmetic/logic files pass state tier |
-| M3 | shifts, bits, BCD, MUL/DIV | their files pass state tier |
+| M3 | shifts, bits, BCD, EXG, MUL/DIV | their files pass state tier |
 | M4 | prefetch queue; remaining exceptions | **all** files pass state tier, `aerr-pc` reaches 0 |
 | M5 | cycle tables tightened | all files pass cycle tier |
 | M6 | TUI debugger | interactive session against a test ROM |
@@ -648,6 +648,25 @@ read-modify-write and memory-destination forms, in both directions — e.g.
 `SUB.l D4, -(A6)` is 22 on hardware, 14 from the model (undercounts). Left as
 compositional-but-imperfect for consistency until M5 tightens cycle tables
 per instruction, rather than hand-tuning constants now.
+
+**M3 status** (104 opcode files, 260000 cases; 21 upstream files skipped as
+unimplemented — the remaining system-instruction/TRAP/CHK line for M4):
+ASx/LSx/ROx/ROXx (register and memory forms), BTST/BCHG/BCLR/BSET (static and
+dynamic), MOVEP, ABCD/SBCD/NBCD, EXG, and MULU/MULS/DIVU/DIVS all pass state
+tier. `aerr-pc` climbs to 25970 (same documented gap); cycle tier trails
+state tier further here than in M2, since MULU/MULS's operand-dependent cost
+and DIVU/DIVS's `140+` computed cost (§4.8) are only roughly modelled.
+**Unexplained failures: 0.**
+
+Two BCD flag rules and one DIVU/DIVS flag rule were pinned down empirically
+against conformance data rather than the manual, which leaves them
+undefined: ABCD's decimal carry threshold is `res > 0x9F`, not the `> 0x99`
+textbook DAA threshold; SBCD's C/X output is a strictly more inclusive
+condition than the one gating its value's high-nibble correction (it also
+fires when the raw operands are exactly equal but a low-nibble borrow still
+occurs); and DIVU/DIVS set N unconditionally on quotient overflow, regardless
+of the (discarded) quotient's actual sign. See `flags.zig`'s `bcdAdd`/`bcdSub`
+and `core.zig`'s `opDiv` for the derivations.
 
 ## 6. References
 
