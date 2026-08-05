@@ -37,9 +37,20 @@ const excluded = [_][]const u8{ "TAS", "TRAPV" };
 /// what the core claims to do. An explicit filter argument bypasses this, so
 /// a family can be watched while it is being implemented.
 const implemented = [_][]const u8{
-    "NOP",     "MOVE.b",        "MOVE.w",        "MOVE.l", "MOVE.q",
-    "MOVEA.w", "MOVEA.l",       "LEA",           "BSR",    "Bcc",
-    "RTS",     "ILLEGAL_LINEA", "ILLEGAL_LINEF",
+    "NOP",      "MOVE.b",        "MOVE.w",        "MOVE.l",   "MOVE.q",
+    "MOVEA.w",  "MOVEA.l",       "LEA",           "BSR",      "Bcc",
+    "RTS",      "ILLEGAL_LINEA", "ILLEGAL_LINEF", "NEG.b",    "NEG.w",
+    "NEG.l",    "NEGX.b",        "NEGX.w",        "NEGX.l",   "NOT.b",
+    "NOT.w",    "NOT.l",         "CLR.b",         "CLR.w",    "CLR.l",
+    "TST.b",    "TST.w",         "TST.l",         "Scc",      "DBcc",
+    "ADD.b",    "ADD.w",         "ADD.l",         "ADDA.w",   "ADDA.l",
+    "AND.b",    "AND.w",         "AND.l",         "SUB.b",    "SUB.w",
+    "SUB.l",    "SUBA.w",        "SUBA.l",        "CMP.b",    "CMP.w",
+    "CMP.l",    "CMPA.w",        "CMPA.l",        "EOR.b",    "EOR.w",
+    "EOR.l",    "OR.b",          "OR.w",          "OR.l",     "ANDItoCCR",
+    "ANDItoSR", "EORItoCCR",     "EORItoSR",      "ORItoCCR", "ORItoSR",
+    "ADDX.b",   "ADDX.w",        "ADDX.l",        "SUBX.b",   "SUBX.w",
+    "SUBX.l",
 };
 
 fn isImplemented(name: []const u8) bool {

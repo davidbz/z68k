@@ -610,12 +610,44 @@ what M4 is for.
 | M5 | cycle tables tightened | all files pass cycle tier |
 | M6 | TUI debugger | interactive session against a test ROM |
 
-**Current status** (13 M1 opcode files, 32500 cases; the remaining 112
-upstream files are skipped as unimplemented): `NOP`, `MOVE.b`, `MOVE.q`,
-`LEA`, `BSR`, `ILLEGAL_LINEA` and `ILLEGAL_LINEF` pass 2500/2500 on **both**
-tiers. `MOVE.w/.l`, `MOVEA.w/.l`, `Bcc` and `RTS` account for all 4608
-`aerr-pc` cases; every case that matches state also matches cycles exactly.
+**M1 status** (13 opcode files, 32500 cases; the remaining 112 upstream files
+skipped as unimplemented): `NOP`, `MOVE.b`, `MOVE.q`, `LEA`, `BSR`,
+`ILLEGAL_LINEA` and `ILLEGAL_LINEF` pass 2500/2500 on **both** tiers.
+`MOVE.w/.l`, `MOVEA.w/.l`, `Bcc` and `RTS` account for all 4608 `aerr-pc`
+cases; every case that matches state also matches cycles exactly.
 **Unexplained failures: 0.**
+
+**M2 status** (66 opcode files, 165000 cases; 61 upstream files skipped as
+unimplemented — M2 is strict ALU, so BCD/MUL/DIV/shifts/bits are left for M3
+and the system-instruction line sharing `0100`'s opcode space for M4/later):
+NEG/NEGX/NOT/CLR/TST, Scc/DBcc, ADD/SUB/AND/OR/EOR/CMP (register, memory and
+address forms), ADDX/SUBX/CMPM, and the immediate/CCR/SR logic group all pass
+state tier. `aerr-pc` climbs to 22273 (the same one documented gap, now hit by
+every family that predecrements/postincrements or reads immediates near a
+misaligned boundary) and cycle-tier pass rate drops for long-sized
+read-modify-write memory destinations (see the note below) — both expected,
+neither gating. **Unexplained failures: 0.**
+
+ADDX/SUBX/CMPM's `-(An)`/`(An)+` memory forms turned up bus-timing quirks not
+implied by the single-operand model above: a misaligned access on one operand
+of a two-operand predecrement/postincrement pair can leave *that* operand's
+address register uncommitted while the other, already-succeeded operand's
+register update stands — a per-operand "commit only on your own success" rule,
+rather than the lone-operand model's "always commit, fault after." Long-sized
+CMPM's source additionally partial-commits +2 (not 0, not +4) when its own
+address is odd. These are implemented as instruction-specific bus-order
+comments in `core.zig` (`opAddSubX`, `opCmpm`) rather than generalized into
+`calcEa`, since they don't hold for the single-operand addressing modes that
+function already serves.
+
+**Known cycle-tier gap** (informational, not gating — M2's gate is state tier
+only): the existing compositional cycle model (base cost + EA cost, shared
+with MOVE/LEA) diverges from hardware on a handful of long-sized
+read-modify-write and memory-destination forms, in both directions — e.g.
+`CLR.l (A3)+` is 58 cycles on hardware, 64 from the model (overcounts);
+`SUB.l D4, -(A6)` is 22 on hardware, 14 from the model (undercounts). Left as
+compositional-but-imperfect for consistency until M5 tightens cycle tables
+per instruction, rather than hand-tuning constants now.
 
 ## 6. References
 
