@@ -58,12 +58,12 @@ test "disassembles what it knows and falls back to dc.w" {
             return switch (addr) {
                 0 => 0x4E71, // nop
                 2 => 0x70FF, // moveq #-1,d0
-                else => 0x4E40, // trap, not decoded yet (TODO M4)
+                else => 0x4EFD, // JMP with a reserved mode-7 register: still illegal
             };
         }
     }.read;
 
     try std.testing.expectEqualStrings("nop", disasm(words, 0).text());
     try std.testing.expectEqualStrings("moveq   #-1,d0", disasm(words, 2).text());
-    try std.testing.expectEqualStrings("dc.w    $4e40", disasm(words, 4).text());
+    try std.testing.expectEqualStrings("dc.w    $4efd", disasm(words, 4).text());
 }

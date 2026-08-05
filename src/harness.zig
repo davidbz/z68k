@@ -37,27 +37,31 @@ const excluded = [_][]const u8{ "TAS", "TRAPV" };
 /// what the core claims to do. An explicit filter argument bypasses this, so
 /// a family can be watched while it is being implemented.
 const implemented = [_][]const u8{
-    "NOP",      "MOVE.b",        "MOVE.w",        "MOVE.l",   "MOVE.q",
-    "MOVEA.w",  "MOVEA.l",       "LEA",           "BSR",      "Bcc",
-    "RTS",      "ILLEGAL_LINEA", "ILLEGAL_LINEF", "NEG.b",    "NEG.w",
-    "NEG.l",    "NEGX.b",        "NEGX.w",        "NEGX.l",   "NOT.b",
-    "NOT.w",    "NOT.l",         "CLR.b",         "CLR.w",    "CLR.l",
-    "TST.b",    "TST.w",         "TST.l",         "Scc",      "DBcc",
-    "ADD.b",    "ADD.w",         "ADD.l",         "ADDA.w",   "ADDA.l",
-    "AND.b",    "AND.w",         "AND.l",         "SUB.b",    "SUB.w",
-    "SUB.l",    "SUBA.w",        "SUBA.l",        "CMP.b",    "CMP.w",
-    "CMP.l",    "CMPA.w",        "CMPA.l",        "EOR.b",    "EOR.w",
-    "EOR.l",    "OR.b",          "OR.w",          "OR.l",     "ANDItoCCR",
-    "ANDItoSR", "EORItoCCR",     "EORItoSR",      "ORItoCCR", "ORItoSR",
-    "ADDX.b",   "ADDX.w",        "ADDX.l",        "SUBX.b",   "SUBX.w",
-    "SUBX.l",   "ASL.b",         "ASL.w",         "ASL.l",    "ASR.b",
-    "ASR.w",    "ASR.l",         "LSL.b",         "LSL.w",    "LSL.l",
-    "LSR.b",    "LSR.w",         "LSR.l",         "ROL.b",    "ROL.w",
-    "ROL.l",    "ROR.b",         "ROR.w",         "ROR.l",    "ROXL.b",
-    "ROXL.w",   "ROXL.l",        "ROXR.b",        "ROXR.w",   "ROXR.l",
-    "BTST",     "BCHG",          "BCLR",          "BSET",     "MOVEP.w",
-    "MOVEP.l",  "ABCD",          "SBCD",          "NBCD",     "EXG",
-    "MULU",     "MULS",          "DIVU",          "DIVS",
+    "NOP",         "MOVE.b",        "MOVE.w",        "MOVE.l",    "MOVE.q",
+    "MOVEA.w",     "MOVEA.l",       "LEA",           "BSR",       "Bcc",
+    "RTS",         "ILLEGAL_LINEA", "ILLEGAL_LINEF", "NEG.b",     "NEG.w",
+    "NEG.l",       "NEGX.b",        "NEGX.w",        "NEGX.l",    "NOT.b",
+    "NOT.w",       "NOT.l",         "CLR.b",         "CLR.w",     "CLR.l",
+    "TST.b",       "TST.w",         "TST.l",         "Scc",       "DBcc",
+    "ADD.b",       "ADD.w",         "ADD.l",         "ADDA.w",    "ADDA.l",
+    "AND.b",       "AND.w",         "AND.l",         "SUB.b",     "SUB.w",
+    "SUB.l",       "SUBA.w",        "SUBA.l",        "CMP.b",     "CMP.w",
+    "CMP.l",       "CMPA.w",        "CMPA.l",        "EOR.b",     "EOR.w",
+    "EOR.l",       "OR.b",          "OR.w",          "OR.l",      "ANDItoCCR",
+    "ANDItoSR",    "EORItoCCR",     "EORItoSR",      "ORItoCCR",  "ORItoSR",
+    "ADDX.b",      "ADDX.w",        "ADDX.l",        "SUBX.b",    "SUBX.w",
+    "SUBX.l",      "ASL.b",         "ASL.w",         "ASL.l",     "ASR.b",
+    "ASR.w",       "ASR.l",         "LSL.b",         "LSL.w",     "LSL.l",
+    "LSR.b",       "LSR.w",         "LSR.l",         "ROL.b",     "ROL.w",
+    "ROL.l",       "ROR.b",         "ROR.w",         "ROR.l",     "ROXL.b",
+    "ROXL.w",      "ROXL.l",        "ROXR.b",        "ROXR.w",    "ROXR.l",
+    "BTST",        "BCHG",          "BCLR",          "BSET",      "MOVEP.w",
+    "MOVEP.l",     "ABCD",          "SBCD",          "NBCD",      "EXG",
+    "MULU",        "MULS",          "DIVU",          "DIVS",      "SWAP",
+    "EXT.w",       "EXT.l",         "PEA",           "LINK",      "UNLINK",
+    "JSR",         "JMP",           "MOVEfromSR",    "MOVEtoCCR", "MOVEtoSR",
+    "MOVEfromUSP", "MOVEtoUSP",     "CHK",           "TRAP",      "STOP",
+    "RESET",       "RTE",           "RTR",           "MOVEM.w",   "MOVEM.l",
 };
 
 fn isImplemented(name: []const u8) bool {
@@ -268,9 +272,9 @@ fn compare(s: *const State, c: *const Cpu, bus: *FlatBus, frame: ?u32) ?Mismatch
         if (frame) |f| {
             const off = addr -% @as(u24, @truncate(f));
             switch (off) {
-                // IR at +6 and the PC longword at +10 are whole words of
-                // prefetch state.
-                6, 10, 12 => continue,
+                // The instruction register: depends on source addressing
+                // mode bus timing, not modeled. See DESIGN.md §5.4.
+                6 => continue,
                 // The special status word keeps the R/W bit and the function
                 // code in its low five bits; the rest is prefetch residue.
                 0 => if ((got ^ w.value) & 0x1F == 0) continue,
