@@ -50,6 +50,13 @@ pub const StatusRegister = packed struct(u16) {
         sr.z = v.z;
         sr.n = v.n;
     }
+
+    /// Like `setNzvc` but also writes X. The arithmetic ops (ADD, SUB, NEG,
+    /// and the X-chain forms) affect X; MOVE and the logic ops do not.
+    pub fn setNzvcx(sr: *StatusRegister, v: Ccr) void {
+        sr.setNzvc(v);
+        sr.x = v.x;
+    }
 };
 
 pub const Size = enum(u2) {

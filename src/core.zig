@@ -31,6 +31,7 @@ pub const Fault = error{
     IllegalInstruction,
     LineA,
     LineF,
+    PrivilegeViolation,
 };
 
 pub fn Core(comptime BusT: type) type {
@@ -373,7 +374,7 @@ pub fn Core(comptime BusT: type) type {
                 // of the offending instruction, not the one after it. The
                 // trap-like faults stack the following instruction.
                 switch (f) {
-                    Fault.IllegalInstruction, Fault.LineA, Fault.LineF => {
+                    Fault.IllegalInstruction, Fault.LineA, Fault.LineF, Fault.PrivilegeViolation => {
                         c.pc = start_pc;
                     },
                     else => {},
@@ -393,6 +394,7 @@ pub fn Core(comptime BusT: type) type {
                 Fault.IllegalInstruction => .illegal_instruction,
                 Fault.LineA => .line_a,
                 Fault.LineF => .line_f,
+                Fault.PrivilegeViolation => .privilege_violation,
             };
         }
 
@@ -419,6 +421,17 @@ pub fn Core(comptime BusT: type) type {
                 .nop => {},
                 .rts => try jump(ctx, try pop32(ctx)),
                 .bra, .bsr, .bcc => try opBranch(ctx, op, instr),
+
+                .negx, .clr, .neg, .not, .tst => try opAluSingle(ctx, op, instr),
+                .addq, .subq => try opQuick(ctx, op, instr),
+                .scc => try opScc(ctx, op),
+                .dbcc => try opDbcc(ctx, op),
+                .add, .sub, .and_, .or_, .eor, .cmp => try opAlu2(ctx, op, instr),
+                .adda, .suba, .cmpa => try opAluA(ctx, op, instr),
+                .ori, .andi, .subi, .addi, .eori, .cmpi => try opImmediateAlu(ctx, op, instr),
+                .ori_ccr, .ori_sr, .andi_ccr, .andi_sr, .eori_ccr, .eori_sr => try opImmediateSr(ctx, instr),
+                .addx, .subx => try opAddSubX(ctx, op, instr),
+                .cmpm => try opCmpm(ctx, op, instr),
 
                 .line_a => return Fault.LineA,
                 .line_f => return Fault.LineF,
@@ -474,6 +487,468 @@ pub fn Core(comptime BusT: type) type {
                 try writeEa(ctx, dst_mode, dst_reg, size, v);
             }
             if (!flags_first) ctx.cpu.sr.setNzvc(cc);
+        }
+
+        /// NEGX/CLR/NEG/NOT/TST: one data operand, read (and for all but TST,
+        /// written back) at the same address computed once. CLR/NOT leave X
+        /// alone (`logic` shape); NEG/NEGX affect it (`sub`/`subx` shape).
+        fn opAluSingle(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            const size = instr.size;
+            const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const reg: u3 = @truncate(op);
+            const mn = instr.mnemonic;
+
+            if (mn == .tst) {
+                ctx.cpu.cycles += mode.cycles(size);
+                const v = try readEa(ctx, mode, reg, size);
+                ctx.cpu.sr.setNzvc(flags.logic(v, size));
+                return;
+            }
+
+            ctx.cpu.cycles += mode.destCycles(size);
+            var addr: u32 = undefined;
+            const old: u32 = if (mode == .data_reg)
+                ctx.cpu.d[reg] & size.mask()
+            else blk: {
+                // This is a read-modify-write, but the first bus cycle is a
+                // read: pass write=false so postinc/predec's fault-timing and
+                // register-writeback rules match a plain read (real hardware
+                // increments/decrements the register on the read side, then
+                // reuses the same address for the write with no further
+                // side effect).
+                addr = try calcEa(ctx, mode, reg, size, false);
+                break :blk try readAt(ctx, addr, size, false);
+            };
+
+            const x_in = ctx.cpu.sr.x;
+            const old_z = ctx.cpu.sr.z;
+            const mask = size.mask();
+            const Result = struct { value: u32, cc: cpu_mod.Ccr };
+            const r: Result = switch (mn) {
+                .clr => .{ .value = 0, .cc = flags.logic(0, size) },
+                .not => blk: {
+                    const v = ~old & mask;
+                    break :blk .{ .value = v, .cc = flags.logic(v, size) };
+                },
+                .neg => .{ .value = (0 -% old) & mask, .cc = flags.sub(0, old, size) },
+                .negx => .{
+                    .value = (0 -% old -% @as(u32, @intFromBool(x_in))) & mask,
+                    .cc = flags.subx(0, old, x_in, size, old_z),
+                },
+                else => unreachable,
+            };
+
+            if (mode == .data_reg) {
+                setReg(&ctx.cpu.d[reg], size, r.value);
+            } else {
+                try writeAt(ctx, addr, size, r.value);
+            }
+
+            switch (mn) {
+                .clr, .not => ctx.cpu.sr.setNzvc(r.cc),
+                else => ctx.cpu.sr.setNzvcx(r.cc),
+            }
+        }
+
+        /// ADDQ/SUBQ: immediate 1-8 (0 in the field means 8). An destination
+        /// is always treated as a long add/sub on the whole register with no
+        /// flags touched, regardless of the encoded size — a real hardware
+        /// special case, not a composable one.
+        fn opQuick(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            const size = instr.size;
+            const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const reg: u3 = @truncate(op);
+            const field: u3 = @truncate(op >> 9);
+            const data: u32 = if (field == 0) 8 else field;
+            const is_sub = instr.mnemonic == .subq;
+
+            if (mode == .addr_reg) {
+                ctx.cpu.a[reg] = if (is_sub) ctx.cpu.a[reg] -% data else ctx.cpu.a[reg] +% data;
+                return;
+            }
+
+            ctx.cpu.cycles += mode.destCycles(size);
+            var addr: u32 = undefined;
+            const old: u32 = if (mode == .data_reg)
+                ctx.cpu.d[reg] & size.mask()
+            else blk: {
+                addr = try calcEa(ctx, mode, reg, size, false);
+                break :blk try readAt(ctx, addr, size, false);
+            };
+
+            const cc = if (is_sub) flags.sub(old, data, size) else flags.add(old, data, size);
+            const result = (if (is_sub) old -% data else old +% data) & size.mask();
+
+            if (mode == .data_reg) {
+                setReg(&ctx.cpu.d[reg], size, result);
+            } else {
+                try writeAt(ctx, addr, size, result);
+            }
+            ctx.cpu.sr.setNzvcx(cc);
+        }
+
+        /// Scc: writes all-ones on true, all-zero on false, to a byte
+        /// destination. Read-modify-write in shape only for memory operands.
+        fn opScc(ctx: *Ctx, op: u16) Fault!void {
+            const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const reg: u3 = @truncate(op);
+            const cond: u4 = @truncate(op >> 8);
+            const true_cond = flags.testCondition(ctx.cpu.sr, cond);
+            const v: u32 = if (true_cond) 0xFF else 0x00;
+
+            if (mode == .data_reg) {
+                // A true condition costs 2 more cycles than false, for any
+                // condition (not just ST) — a real hardware quirk the
+                // decode-time base_cycles can't express.
+                if (true_cond) ctx.cpu.cycles += 2;
+                setReg(&ctx.cpu.d[reg], .byte, v);
+            } else {
+                ctx.cpu.cycles += mode.destCycles(.byte);
+                const addr = try calcEa(ctx, mode, reg, .byte, false);
+                try writeAt(ctx, addr, .byte, v);
+            }
+        }
+
+        /// DBcc: if the condition is false, decrement the low word of Dn and
+        /// branch while it hasn't wrapped from 0 to -1. The condition true and
+        /// the counter-expired cases both fall through without branching.
+        fn opDbcc(ctx: *Ctx, op: u16) Fault!void {
+            const c = ctx.cpu;
+            const reg: u3 = @truncate(op);
+            const cond: u4 = @truncate(op >> 8);
+            const base = c.pc; // address of the displacement word
+            const disp: i16 = @bitCast(try fetch16(ctx));
+
+            if (flags.testCondition(c.sr, cond)) return;
+
+            const count: u16 = @truncate(c.d[reg]);
+            const new_count = count -% 1;
+
+            if (new_count != 0xFFFF) {
+                c.cycles -= 2; // branch taken: 10 total, base covers the untaken 12
+                // The branch target is validated before Dn commits: a
+                // faulting branch (odd target) leaves Dn at its old value.
+                try jump(ctx, base +% @as(u32, @bitCast(@as(i32, disp))));
+                setReg(&c.d[reg], .word, new_count);
+            } else {
+                c.cycles += 2; // counter expired, no branch: 14 total
+                setReg(&c.d[reg], .word, new_count);
+            }
+        }
+
+        /// Shared by `opAlu2`'s ea-is-destination direction and
+        /// `opImmediateAlu`: both are "read old, combine with a source, maybe
+        /// write back" over the same six operations, just with the source
+        /// coming from Dn vs an immediate.
+        const AluOp = enum { add, sub, cmp, and_, or_, eor };
+        const AluResult = struct { value: u32, cc: cpu_mod.Ccr, affects_x: bool, writes: bool };
+
+        fn aluCompute(kind: AluOp, old: u32, src: u32, size: Size) AluResult {
+            return switch (kind) {
+                .add => .{ .value = (old +% src) & size.mask(), .cc = flags.add(old, src, size), .affects_x = true, .writes = true },
+                .sub => .{ .value = (old -% src) & size.mask(), .cc = flags.sub(old, src, size), .affects_x = true, .writes = true },
+                .cmp => .{ .value = 0, .cc = flags.sub(old, src, size), .affects_x = false, .writes = false },
+                .and_ => blk: {
+                    const v = old & src;
+                    break :blk .{ .value = v, .cc = flags.logic(v, size), .affects_x = false, .writes = true };
+                },
+                .or_ => blk: {
+                    const v = old | src;
+                    break :blk .{ .value = v, .cc = flags.logic(v, size), .affects_x = false, .writes = true };
+                },
+                .eor => blk: {
+                    const v = old ^ src;
+                    break :blk .{ .value = v, .cc = flags.logic(v, size), .affects_x = false, .writes = true };
+                },
+            };
+        }
+
+        /// ADD/SUB/AND/OR/EOR/CMP two-operand forms. One operand is always
+        /// Dn; `is_re` picks which side is the destination. EOR only ever
+        /// writes to `ea` (which may itself be Dn); CMP only ever reads,
+        /// discarding the result.
+        fn opAlu2(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            const size = instr.size;
+            const mn = instr.mnemonic;
+            const dn: u3 = @truncate(op >> 9);
+            const ea_mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const ea_reg: u3 = @truncate(op);
+
+            const is_re = switch (mn) {
+                .cmp => false,
+                .eor => true,
+                else => op & 0x0100 != 0,
+            };
+
+            if (!is_re) {
+                // Dn = Dn op ea (or, for CMP, just Dn - ea into the flags).
+                ctx.cpu.cycles += ea_mode.cycles(size);
+                const src = try readEa(ctx, ea_mode, ea_reg, size);
+                const dst = ctx.cpu.d[dn] & size.mask();
+
+                switch (mn) {
+                    .cmp => ctx.cpu.sr.setNzvc(flags.sub(dst, src, size)),
+                    .add => {
+                        const cc = flags.add(dst, src, size);
+                        setReg(&ctx.cpu.d[dn], size, (dst +% src) & size.mask());
+                        ctx.cpu.sr.setNzvcx(cc);
+                    },
+                    .sub => {
+                        const cc = flags.sub(dst, src, size);
+                        setReg(&ctx.cpu.d[dn], size, (dst -% src) & size.mask());
+                        ctx.cpu.sr.setNzvcx(cc);
+                    },
+                    .and_, .or_ => {
+                        const v = if (mn == .and_) dst & src else dst | src;
+                        setReg(&ctx.cpu.d[dn], size, v);
+                        ctx.cpu.sr.setNzvc(flags.logic(v, size));
+                    },
+                    else => unreachable,
+                }
+                return;
+            }
+
+            // ea = ea op Dn. Read-modify-write in shape only for a memory ea;
+            // EOR's ea may also be Dn, a plain register-register op.
+            ctx.cpu.cycles += ea_mode.destCycles(size);
+            const src = ctx.cpu.d[dn] & size.mask();
+            var addr: u32 = undefined;
+            const old: u32 = if (ea_mode == .data_reg)
+                ctx.cpu.d[ea_reg] & size.mask()
+            else blk: {
+                addr = try calcEa(ctx, ea_mode, ea_reg, size, false);
+                break :blk try readAt(ctx, addr, size, false);
+            };
+
+            const kind: AluOp = switch (mn) {
+                .add => .add,
+                .sub => .sub,
+                .and_ => .and_,
+                .or_ => .or_,
+                .eor => .eor,
+                else => unreachable,
+            };
+            const r = aluCompute(kind, old, src, size);
+
+            if (ea_mode == .data_reg) {
+                setReg(&ctx.cpu.d[ea_reg], size, r.value);
+            } else {
+                try writeAt(ctx, addr, size, r.value);
+            }
+            if (r.affects_x) ctx.cpu.sr.setNzvcx(r.cc) else ctx.cpu.sr.setNzvc(r.cc);
+        }
+
+        /// ADDA/SUBA/CMPA: word source is sign extended before the 32-bit
+        /// address-register op. Unlike ADD/SUB/CMP, ADDA/SUBA never touch the
+        /// flags; CMPA sets them the same way CMP does.
+        fn opAluA(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            const size = instr.size;
+            const an: u3 = @truncate(op >> 9);
+            const ea_mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const ea_reg: u3 = @truncate(op);
+
+            ctx.cpu.cycles += ea_mode.cycles(size);
+            const src = signExtend(try readEa(ctx, ea_mode, ea_reg, size), size);
+
+            switch (instr.mnemonic) {
+                .adda => ctx.cpu.a[an] +%= src,
+                .suba => ctx.cpu.a[an] -%= src,
+                .cmpa => ctx.cpu.sr.setNzvc(flags.sub(ctx.cpu.a[an], src, .long)),
+                else => unreachable,
+            }
+        }
+
+        /// ORI/ANDI/SUBI/ADDI/EORI/CMPI: immediate always the source, `ea` the
+        /// destination (Dn or memory), except CMPI which only reads `ea` and
+        /// discards the result. `write=false` in `calcEa` matches the RMW
+        /// convention `opAlu2` already uses: the initial read never recomputes
+        /// the address, so its fault timing is the "read" shape even when a
+        /// write follows.
+        fn opImmediateAlu(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            const size = instr.size;
+            const mn = instr.mnemonic;
+            const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
+            const reg: u3 = @truncate(op);
+
+            const imm = switch (size) {
+                .byte => @as(u32, @as(u8, @truncate(try fetch16(ctx)))),
+                .word => @as(u32, try fetch16(ctx)),
+                .long => try fetch32(ctx),
+            };
+
+            ctx.cpu.cycles += mode.destCycles(size);
+            var addr: u32 = undefined;
+            const old: u32 = if (mode == .data_reg)
+                ctx.cpu.d[reg] & size.mask()
+            else blk: {
+                addr = try calcEa(ctx, mode, reg, size, false);
+                break :blk try readAt(ctx, addr, size, false);
+            };
+
+            const kind: AluOp = switch (mn) {
+                .ori => .or_,
+                .andi => .and_,
+                .eori => .eor,
+                .addi => .add,
+                .subi => .sub,
+                .cmpi => .cmp,
+                else => unreachable,
+            };
+            const r = aluCompute(kind, old, imm, size);
+
+            if (r.writes) {
+                if (mode == .data_reg) {
+                    setReg(&ctx.cpu.d[reg], size, r.value);
+                } else {
+                    try writeAt(ctx, addr, size, r.value);
+                }
+            }
+            if (r.affects_x) ctx.cpu.sr.setNzvcx(r.cc) else ctx.cpu.sr.setNzvc(r.cc);
+        }
+
+        /// ORI/ANDI/EORI to CCR/SR: fixed opcodes, immediate word follows.
+        /// The `toSR` forms are privileged: a user-mode attempt faults before
+        /// the immediate word is even fetched.
+        fn opImmediateSr(ctx: *Ctx, instr: decode.Instr) Fault!void {
+            const mn = instr.mnemonic;
+            switch (mn) {
+                .ori_sr, .andi_sr, .eori_sr => if (!ctx.cpu.sr.s) return Fault.PrivilegeViolation,
+                else => {},
+            }
+            const imm = try fetch16(ctx);
+
+            switch (mn) {
+                .ori_ccr, .andi_ccr, .eori_ccr => {
+                    const old: u16 = ctx.cpu.sr.toInt() & 0xFF;
+                    const v: u16 = switch (mn) {
+                        .ori_ccr => old | (imm & 0xFF),
+                        .andi_ccr => old & (imm & 0xFF),
+                        .eori_ccr => old ^ (imm & 0xFF),
+                        else => unreachable,
+                    };
+                    const full = (ctx.cpu.sr.toInt() & 0xFF00) | v;
+                    ctx.cpu.sr = cpu_mod.StatusRegister.fromInt(full);
+                },
+                .ori_sr, .andi_sr, .eori_sr => {
+                    const old = ctx.cpu.sr.toInt();
+                    const v: u16 = switch (mn) {
+                        .ori_sr => old | imm,
+                        .andi_sr => old & imm,
+                        .eori_sr => old ^ imm,
+                        else => unreachable,
+                    };
+                    const new_sr = cpu_mod.StatusRegister.fromInt(v);
+                    ctx.cpu.setSupervisor(new_sr.s);
+                    ctx.cpu.sr = new_sr;
+                },
+                else => unreachable,
+            }
+        }
+
+        /// A long read at a predecrement address used by ADDX/SUBX's memory
+        /// form: faults low-word-first (addr+2), read bit set, same as the
+        /// rest of that instruction's dual-predecrement bus ordering.
+        fn predecLongRead(ctx: *Ctx, addr: u32) Fault!u32 {
+            if (addr & 1 != 0) return addressError(ctx, addr +% 2, true, false);
+            return read32(ctx, addr, false);
+        }
+
+        /// ADDX/SUBX: Dy,Dx (register-register) or -(Ay),-(Ax) (memory pair,
+        /// bit 3 of the opcode set). Unlike ADD/SUB, the Z flag can only be
+        /// cleared here, never set (`flags.addx`/`subx`'s `old_z` chaining),
+        /// so multi-word extended arithmetic reads as zero only if every
+        /// word in the chain was.
+        fn opAddSubX(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            const size = instr.size;
+            const is_sub = instr.mnemonic == .subx;
+            const rx: u3 = @truncate(op >> 9);
+            const ry: u3 = @truncate(op);
+            const mem_form = op & 0x0008 != 0;
+
+            const old_z = ctx.cpu.sr.z;
+            const x_in = ctx.cpu.sr.x;
+
+            var dst_addr: u32 = undefined;
+            var src: u32 = undefined;
+            var dst: u32 = undefined;
+            if (mem_form and size == .long) {
+                // Long size only: each operand's predecrement commits only
+                // if *that* operand's own access succeeds — unlike a lone
+                // predecrement read elsewhere, which always commits before
+                // the fault. Its bus cycle also goes low-word-first (fault
+                // address is addr+2, matching a long *write*'s ordering)
+                // even though it's only ever read. The second address
+                // cascades off the first's result when Ax and Ay are the
+                // same register.
+                const src_addr = ctx.cpu.a[ry] -% stackAdjust(ry, size);
+                src = try predecLongRead(ctx, src_addr);
+                ctx.cpu.a[ry] = src_addr;
+
+                dst_addr = calcEa(ctx, .addr_predec, rx, size, true) catch |e| {
+                    ctx.fault.?.read = true;
+                    return e;
+                };
+                dst = try readAt(ctx, dst_addr, size, false);
+            } else if (mem_form) {
+                const src_addr = try calcEa(ctx, .addr_predec, ry, size, false);
+                src = try readAt(ctx, src_addr, size, false);
+                dst_addr = try calcEa(ctx, .addr_predec, rx, size, true);
+                dst = try readAt(ctx, dst_addr, size, false);
+            } else {
+                src = ctx.cpu.d[ry] & size.mask();
+                dst = ctx.cpu.d[rx] & size.mask();
+            }
+
+            const cc = if (is_sub) flags.subx(dst, src, x_in, size, old_z) else flags.addx(dst, src, x_in, size, old_z);
+            const x = @intFromBool(x_in);
+            const value = if (is_sub) (dst -% src -% x) & size.mask() else (dst +% src +% x) & size.mask();
+
+            if (mem_form) {
+                try writeAt(ctx, dst_addr, size, value);
+            } else {
+                setReg(&ctx.cpu.d[rx], size, value);
+            }
+            ctx.cpu.sr.setNzvcx(cc);
+        }
+
+        /// CMPM: (Ay)+,(Ax)+ — both operands postincrement independently, no
+        /// writeback, source read before destination. The destination read
+        /// passes `write=true` to `calcEa` even though nothing is written
+        /// back: empirically, a misaligned destination access leaves Ax
+        /// un-incremented (fault detected before the register updates),
+        /// unlike the source, which increments unconditionally before its
+        /// own bus cycle. `write=true` also flips the fault frame's R/W bit
+        /// to "write", which is wrong here — it's a read — so it's patched
+        /// back after the fact if a fault was raised.
+        ///
+        /// Long size only, the source read commits a partial +2 (not the
+        /// full +4, not 0) when its own address is misaligned: empirically
+        /// the first word's postincrement lands before the second word's
+        /// access faults.
+        fn opCmpm(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            const size = instr.size;
+            const ax: u3 = @truncate(op >> 9);
+            const ay: u3 = @truncate(op);
+
+            const src = if (size == .long) blk: {
+                const addr = ctx.cpu.a[ay];
+                if (addr & 1 != 0) {
+                    ctx.cpu.a[ay] +%= 2;
+                    return addressError(ctx, addr, true, false);
+                }
+                ctx.cpu.a[ay] +%= 4;
+                break :blk try read32(ctx, addr, false);
+            } else blk: {
+                const src_addr = try calcEa(ctx, .addr_postinc, ay, size, false);
+                break :blk try readAt(ctx, src_addr, size, false);
+            };
+            const dst_addr = calcEa(ctx, .addr_postinc, ax, size, true) catch |e| {
+                ctx.fault.?.read = true;
+                return e;
+            };
+            const dst = try readAt(ctx, dst_addr, size, false);
+
+            ctx.cpu.sr.setNzvc(flags.sub(dst, src, size));
         }
 
         fn opMoveq(ctx: *Ctx, op: u16) void {
@@ -625,6 +1100,113 @@ test "byte access through -(a7) keeps the stack word aligned" {
     try std.testing.expectEqual(@as(u8, 0x42), bus.read8(0x0FFE));
 }
 
+test "neg.w -(a0) negates memory, decrements first, and sets X" {
+    var bus = try testBus(std.testing.allocator);
+    defer std.testing.allocator.free(bus.ram);
+
+    bus.write16(0x400, 0x4460); // neg.w -(a0)
+    bus.write16(0x0FFE, 0x1234);
+    var c = Cpu{ .pc = 0x400 };
+    c.a[0] = 0x1000;
+
+    TestCore.step(&c, &bus);
+
+    try std.testing.expectEqual(@as(u32, 0x0FFE), c.a[0]);
+    try std.testing.expectEqual(@as(u16, 0xEDCC), bus.read16(0x0FFE));
+    try std.testing.expect(c.sr.x and c.sr.c and !c.sr.z);
+}
+
+test "clr.l d0 zeroes the register and leaves X alone" {
+    var bus = try testBus(std.testing.allocator);
+    defer std.testing.allocator.free(bus.ram);
+
+    bus.write16(0x400, 0x4280); // clr.l d0
+    var c = Cpu{ .pc = 0x400 };
+    c.d[0] = 0xDEAD_BEEF;
+    c.sr.x = true;
+
+    TestCore.step(&c, &bus);
+
+    try std.testing.expectEqual(@as(u32, 0), c.d[0]);
+    try std.testing.expect(c.sr.z and !c.sr.n and !c.sr.v and !c.sr.c and c.sr.x);
+}
+
+test "tst.b does not write back" {
+    var bus = try testBus(std.testing.allocator);
+    defer std.testing.allocator.free(bus.ram);
+
+    bus.write16(0x400, 0x4A10); // tst.b (a0)
+    bus.write8(0x1000, 0x80);
+    var c = Cpu{ .pc = 0x400 };
+    c.a[0] = 0x1000;
+
+    TestCore.step(&c, &bus);
+
+    try std.testing.expectEqual(@as(u8, 0x80), bus.read8(0x1000));
+    try std.testing.expect(c.sr.n and !c.sr.z);
+}
+
+test "addq/subq: An destination is a plain long add with no flags" {
+    var bus = try testBus(std.testing.allocator);
+    defer std.testing.allocator.free(bus.ram);
+
+    bus.write16(0x400, 0x5548); // subq.w #2,a0
+    var c = Cpu{ .pc = 0x400 };
+    c.a[0] = 0x1000;
+    c.sr.z = true; // untouched: An destination never affects flags
+
+    TestCore.step(&c, &bus);
+
+    try std.testing.expectEqual(@as(u32, 0x0FFE), c.a[0]);
+    try std.testing.expect(c.sr.z);
+}
+
+test "addq: Dn destination sets flags normally" {
+    var bus = try testBus(std.testing.allocator);
+    defer std.testing.allocator.free(bus.ram);
+
+    bus.write16(0x400, 0x5A00); // addq.b #5,d0 (field 101 = 5)
+    var c = Cpu{ .pc = 0x400 };
+    c.d[0] = 0xFF; // -1 as a byte
+
+    TestCore.step(&c, &bus);
+
+    try std.testing.expectEqual(@as(u32, 0x04), c.d[0]);
+    try std.testing.expect(c.sr.c and c.sr.x and !c.sr.z);
+}
+
+test "scc writes all-ones or all-zero based on the condition" {
+    var bus = try testBus(std.testing.allocator);
+    defer std.testing.allocator.free(bus.ram);
+
+    bus.write16(0x400, 0x57C0); // seq d0
+    var c = Cpu{ .pc = 0x400 };
+    c.sr.z = true;
+    c.d[0] = 0xAAAA_AAAA;
+
+    TestCore.step(&c, &bus);
+
+    try std.testing.expectEqual(@as(u32, 0xAAAA_AAFF), c.d[0]);
+}
+
+test "dbcc loops until the counter expires, then falls through" {
+    var bus = try testBus(std.testing.allocator);
+    defer std.testing.allocator.free(bus.ram);
+
+    bus.write16(0x400, 0x51C8); // dbf d0, *-2 (branch back to itself)
+    bus.write16(0x402, 0xFFFE); // displacement -2
+    var c = Cpu{ .pc = 0x400 };
+    c.d[0] = 1;
+
+    TestCore.step(&c, &bus); // count 1 -> 0, branches back
+    try std.testing.expectEqual(@as(u32, 0), c.d[0]);
+    try std.testing.expectEqual(@as(u32, 0x400), c.pc);
+
+    TestCore.step(&c, &bus); // count 0 -> -1, expires, falls through
+    try std.testing.expectEqual(@as(u32, 0xFFFF), c.d[0]);
+    try std.testing.expectEqual(@as(u32, 0x404), c.pc);
+}
+
 test "odd word access raises an address error" {
     var bus = try testBus(std.testing.allocator);
     defer std.testing.allocator.free(bus.ram);
@@ -743,6 +1325,31 @@ test "interrupts respect the mask and wake STOP" {
     try std.testing.expectEqual(@as(u3, 4), c.sr.ipl);
 }
 
+test "trace fires one instruction after T is sampled, outranking interrupts" {
+    var bus = try testBus(std.testing.allocator);
+    defer std.testing.allocator.free(bus.ram);
+
+    bus.write16(0x26, 0x3000); // trace vector (9 * 4 = 0x24)
+    bus.write16(0x400, 0x4E71); // nop
+    var c = Cpu{ .pc = 0x400, .sr = .{ .s = true, .t = true } };
+    c.a[7] = 0x1800;
+
+    // The traced instruction still executes and advances PC normally.
+    TestCore.step(&c, &bus);
+    try std.testing.expectEqual(@as(u32, 0x402), c.pc);
+    try std.testing.expect(c.trace_pending);
+
+    // A pending interrupt does not preempt the trace that was sampled first.
+    TestCore.setIpl(&c, 7);
+    TestCore.step(&c, &bus);
+
+    try std.testing.expectEqual(@as(u32, 0x3000), c.pc);
+    try std.testing.expect(!c.sr.t);
+    try std.testing.expect(!c.trace_pending);
+    try std.testing.expectEqual(@as(u32, 0x1800 - 6), c.a[7]); // 3-word frame
+    try std.testing.expectEqual(@as(u16, 0x402), bus.read16(0x1800 - 2)); // saved pc low
+}
+
 test "run returns at least the requested budget" {
     var bus = try testBus(std.testing.allocator);
     defer std.testing.allocator.free(bus.ram);
@@ -753,4 +1360,80 @@ test "run returns at least the requested budget" {
     const ran = TestCore.run(&c, &bus, 40);
     try std.testing.expect(ran >= 40);
     try std.testing.expectEqual(@as(u32, 0x400 + 40 / 4 * 2), c.pc);
+}
+
+test "ori to ccr sets flags from an immediate, leaving the upper byte alone" {
+    var bus = try testBus(std.testing.allocator);
+    defer std.testing.allocator.free(bus.ram);
+
+    bus.write16(0x400, 0x003C); // ori #imm,ccr
+    bus.write16(0x402, 0x0014); // Z (bit2) | X (bit4)
+    var c = Cpu{ .pc = 0x400 };
+    c.sr.s = true; // supervisor, so the frame path in setSupervisor isn't hit
+    c.sr.n = true;
+
+    TestCore.step(&c, &bus);
+
+    try std.testing.expect(c.sr.z and c.sr.x and c.sr.n);
+    try std.testing.expect(c.sr.s); // untouched: ORI to CCR never affects the upper byte
+}
+
+test "addx.l -(Ay),-(Ax): a misaligned source leaves both operands uncommitted" {
+    var bus = try testBus(std.testing.allocator);
+    defer std.testing.allocator.free(bus.ram);
+
+    bus.write16(0x0C, 0x0000);
+    bus.write16(0x0E, 0x2000);
+
+    bus.write16(0x400, 0xD189); // addx.l -(a1),-(a0)
+    var c = Cpu{ .pc = 0x400 };
+    c.a[0] = 0x2000;
+    c.a[1] = 0x1001; // odd: -4 lands on 0x0FFD
+    c.a[7] = 0x1800;
+
+    TestCore.step(&c, &bus);
+
+    try std.testing.expect(c.sr.s); // address error taken
+    try std.testing.expectEqual(@as(u32, 0x1001), c.a[1]); // source never committed
+    try std.testing.expectEqual(@as(u32, 0x2000), c.a[0]); // destination never reached
+}
+
+test "addx.l -(Ay),-(Ax): a misaligned destination commits the source but not itself" {
+    var bus = try testBus(std.testing.allocator);
+    defer std.testing.allocator.free(bus.ram);
+
+    bus.write16(0x0C, 0x0000);
+    bus.write16(0x0E, 0x2000);
+
+    bus.write16(0x400, 0xD189); // addx.l -(a1),-(a0)
+    var c = Cpu{ .pc = 0x400 };
+    c.a[0] = 0x2001; // odd: -4 lands on 0x1FFD
+    c.a[1] = 0x1004; // aligned, reads cleanly from zeroed ram
+    c.a[7] = 0x1800;
+
+    TestCore.step(&c, &bus);
+
+    try std.testing.expect(c.sr.s);
+    try std.testing.expectEqual(@as(u32, 0x1000), c.a[1]); // source's own access succeeded
+    try std.testing.expectEqual(@as(u32, 0x2001), c.a[0]); // destination never commits on fault
+}
+
+test "cmpm.l (Ay)+,(Ax)+: a misaligned destination leaves it uncommitted after the source already advanced" {
+    var bus = try testBus(std.testing.allocator);
+    defer std.testing.allocator.free(bus.ram);
+
+    bus.write16(0x0C, 0x0000);
+    bus.write16(0x0E, 0x2000);
+
+    bus.write16(0x400, 0xB38C); // cmpm.l (a4)+,(a1)+
+    var c = Cpu{ .pc = 0x400 };
+    c.a[4] = 0x1000; // aligned source
+    c.a[1] = 0x2001; // odd destination
+    c.a[7] = 0x1800;
+
+    TestCore.step(&c, &bus);
+
+    try std.testing.expect(c.sr.s);
+    try std.testing.expectEqual(@as(u32, 0x1004), c.a[4]); // source postincrements unconditionally
+    try std.testing.expectEqual(@as(u32, 0x2001), c.a[1]); // destination never commits on fault
 }

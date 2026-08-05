@@ -58,12 +58,12 @@ test "disassembles what it knows and falls back to dc.w" {
             return switch (addr) {
                 0 => 0x4E71, // nop
                 2 => 0x70FF, // moveq #-1,d0
-                else => 0x0000, // not decoded yet
+                else => 0xE000, // shift/rotate, not decoded yet (TODO M3)
             };
         }
     }.read;
 
     try std.testing.expectEqualStrings("nop", disasm(words, 0).text());
     try std.testing.expectEqualStrings("moveq   #-1,d0", disasm(words, 2).text());
-    try std.testing.expectEqualStrings("dc.w    $0000", disasm(words, 4).text());
+    try std.testing.expectEqualStrings("dc.w    $e000", disasm(words, 4).text());
 }
