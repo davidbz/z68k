@@ -38,8 +38,9 @@ No other dependencies.
 ## Building
 
 ```sh
-zig build          # library + executables into zig-out/
-zig build test     # unit tests
+zig build              # library + executables into zig-out/
+zig build test         # unit, sequence and soak tests
+zig build fuzz --fuzz  # coverage-guided fuzzing (see src/fuzz_test.zig)
 ```
 
 ## Running the conformance suite
@@ -90,6 +91,8 @@ src/decode.zig     EaMode, comptime 64K-entry decode table  (data + pure fns)
 src/flags.zig      condition-code computation               (pure fns)
 src/core.zig       Core(BusT): step/run/reset/EA/exceptions (logic)
 src/harness.zig    SingleStepTests conformance runner
+src/system_test.zig  interrupts, STOP, trace, reset, halted   (sequences)
+src/fuzz_test.zig    step() vs. a contract-checking bus       (invariants)
 ```
 
 Design in one paragraph: all state lives in plain copyable structs and all

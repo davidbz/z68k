@@ -42,13 +42,15 @@ Sega Genesis emulator (separate repo). Toolchain: Zig 0.16.0.
 File layout:
 
 ```
-build.zig, build.zig.zon   module `m68k`; exe `z68k-sst`; steps `test`, `sst`
+build.zig, build.zig.zon   module `m68k`; exe `z68k-sst`; steps `test`, `sst`, `fuzz`
 src/root.zig               public surface
 src/cpu.zig                Cpu, StatusRegister, Size, Exception   (data)
 src/decode.zig             pattern tables, EaMode, comptime table (data + pure fns)
 src/flags.zig              pure flag computation                  (pure fns)
 src/core.zig               Core(BusT): step/run/reset/EA/traps    (logic)
 src/harness.zig            SingleStepTests runner
+src/system_test.zig        multi-instruction tests: interrupts, STOP, trace, reset
+src/fuzz_test.zig          step() vs. a contract-checking bus  (§5.7)
 tools/fetch_tests.sh       clone + decode test data → testdata/ (gitignored)
 ```
 
