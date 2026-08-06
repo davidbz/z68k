@@ -35,6 +35,23 @@ TRAPV — plus the exception machinery and data-dependent divide timing.
 
 No other dependencies.
 
+## Use as a dependency
+
+```sh
+zig fetch --save git+https://github.com/davidbz/z68k#v0.0.1
+```
+
+Then wire the `m68k` module into your build:
+
+```zig
+const z68k = b.dependency("z68k", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("m68k", z68k.module("m68k"));
+```
+
+```zig
+const m68k = @import("m68k");
+```
+
 ## Building
 
 ```sh
