@@ -10,9 +10,9 @@
 //! JSON, and the JSON parse itself. One test is decoded and run at a time, so
 //! the whole suite runs in a fixed amount of memory.
 //!
-//! Results are reported in two tiers. Architectural state (registers, SR, PC,
-//! memory) must match; cycle counts are counted separately so timing work can
-//! lag behind correctness work without hiding it.
+//! Results are reported in two tiers, architectural state (registers, SR, PC,
+//! memory) and total cycles, and every file must pass both: the counts are
+//! kept apart only so a regression says which kind it is.
 
 const std = @import("std");
 const m68k = @import("m68k");
@@ -27,50 +27,6 @@ const test_dir = "testdata/v1";
 /// image is literal.
 const pc_prefetch_offset = 4;
 const even_bus_addr_mask = 0xFF_FFFE;
-
-/// Verified faulty upstream: TAS does not model its read-modify-write timing,
-/// and TRAPV triggers on the wrong condition.
-const excluded = [_][]const u8{ "TAS", "TRAPV" };
-
-/// Instruction families the core implements so far (DESIGN.md §5.5 milestone
-/// gates). Everything else is skipped and counted: the build gates only on
-/// what the core claims to do. An explicit filter argument bypasses this, so
-/// a family can be watched while it is being implemented.
-const implemented = [_][]const u8{
-    "NOP",         "MOVE.b",        "MOVE.w",        "MOVE.l",    "MOVE.q",
-    "MOVEA.w",     "MOVEA.l",       "LEA",           "BSR",       "Bcc",
-    "RTS",         "ILLEGAL_LINEA", "ILLEGAL_LINEF", "NEG.b",     "NEG.w",
-    "NEG.l",       "NEGX.b",        "NEGX.w",        "NEGX.l",    "NOT.b",
-    "NOT.w",       "NOT.l",         "CLR.b",         "CLR.w",     "CLR.l",
-    "TST.b",       "TST.w",         "TST.l",         "Scc",       "DBcc",
-    "ADD.b",       "ADD.w",         "ADD.l",         "ADDA.w",    "ADDA.l",
-    "AND.b",       "AND.w",         "AND.l",         "SUB.b",     "SUB.w",
-    "SUB.l",       "SUBA.w",        "SUBA.l",        "CMP.b",     "CMP.w",
-    "CMP.l",       "CMPA.w",        "CMPA.l",        "EOR.b",     "EOR.w",
-    "EOR.l",       "OR.b",          "OR.w",          "OR.l",      "ANDItoCCR",
-    "ANDItoSR",    "EORItoCCR",     "EORItoSR",      "ORItoCCR",  "ORItoSR",
-    "ADDX.b",      "ADDX.w",        "ADDX.l",        "SUBX.b",    "SUBX.w",
-    "SUBX.l",      "ASL.b",         "ASL.w",         "ASL.l",     "ASR.b",
-    "ASR.w",       "ASR.l",         "LSL.b",         "LSL.w",     "LSL.l",
-    "LSR.b",       "LSR.w",         "LSR.l",         "ROL.b",     "ROL.w",
-    "ROL.l",       "ROR.b",         "ROR.w",         "ROR.l",     "ROXL.b",
-    "ROXL.w",      "ROXL.l",        "ROXR.b",        "ROXR.w",    "ROXR.l",
-    "BTST",        "BCHG",          "BCLR",          "BSET",      "MOVEP.w",
-    "MOVEP.l",     "ABCD",          "SBCD",          "NBCD",      "EXG",
-    "MULU",        "MULS",          "DIVU",          "DIVS",      "SWAP",
-    "EXT.w",       "EXT.l",         "PEA",           "LINK",      "UNLINK",
-    "JSR",         "JMP",           "MOVEfromSR",    "MOVEtoCCR", "MOVEtoSR",
-    "MOVEfromUSP", "MOVEtoUSP",     "CHK",           "TRAP",      "STOP",
-    "RESET",       "RTE",           "RTR",           "MOVEM.w",   "MOVEM.l",
-};
-
-fn isImplemented(name: []const u8) bool {
-    const stem = name[0 .. name.len - ".json.bin".len];
-    for (implemented) |i| {
-        if (std.mem.eql(u8, stem, i)) return true;
-    }
-    return false;
-}
 
 /// Generous: the widest instruction (MOVEM of all 16 registers) touches 32
 /// words, plus an exception frame.
@@ -279,22 +235,6 @@ fn load(s: *const State, c: *Cpu, bus: *TrackedBus) void {
     for (s.ram) |w| bus.write16(@truncate(w.addr & even_bus_addr_mask), w.value);
 }
 
-/// N/Z/V/C bits, mid-microcode when a fault frame is being compared (see
-/// `compare`'s `frame` doc comment) -- ignored on both the live SR and the
-/// stacked SR in the exception frame.
-const sr_ignore_nzvc_mask: u16 = 0xFFF0;
-
-// Offsets within a group 0 exception frame.
-/// The special status word keeps the R/W bit and the function code in its
-/// low five bits; the rest is prefetch residue.
-const ssw_offset = 0;
-/// The instruction register: depends on source addressing mode bus timing,
-/// not modeled. See DESIGN.md §5.4.
-const frame_ir_offset = 6;
-/// The saved SR carries N/Z/V/C from mid-microcode, like the live SR (see
-/// the sr compare in `compare`).
-const frame_sr_offset = 8;
-
 const Mismatch = struct {
     what: []const u8,
     index: u8 = 0,
@@ -304,12 +244,9 @@ const Mismatch = struct {
     actual: u32,
 };
 
-/// `frame` is the base of a group 0 exception frame whose prefetch-derived
-/// fields should be left out of the comparison, used to bucket the one known
-/// gap (DESIGN.md §5.4) instead of hiding it. Everything else in the frame --
-/// the special status word, the faulting address and the saved SR -- is still
-/// checked.
-fn compare(s: *const State, c: *const Cpu, bus: *TrackedBus, frame: ?u32) ?Mismatch {
+/// Everything is compared exactly, including every word of a group 0
+/// exception frame: nothing here is masked or excused.
+fn compare(s: *const State, c: *const Cpu, bus: *TrackedBus) ?Mismatch {
     for (s.d, 0..) |want, i| {
         if (c.d[i] != want) return .{ .what = "d", .index = @intCast(i), .expected = want, .actual = c.d[i] };
     }
@@ -320,11 +257,7 @@ fn compare(s: *const State, c: *const Cpu, bus: *TrackedBus, frame: ?u32) ?Misma
     if (c.userSp() != s.usp) return .{ .what = "usp", .expected = s.usp, .actual = c.userSp() };
 
     const sr = m68k.StatusRegister.fromInt(@truncate(s.sr)).toInt();
-    // In a faulting case, N/Z/V/C depend on how far the microcode got before
-    // the fault, which is prefetch-order state this core does not model —
-    // part of the same known gap as the frame fields (DESIGN.md §5.4).
-    const sr_mask: u16 = if (frame != null) sr_ignore_nzvc_mask else 0xFFFF;
-    if ((c.sr.toInt() ^ sr) & sr_mask != 0) return .{ .what = "sr", .expected = sr, .actual = c.sr.toInt() };
+    if (c.sr.toInt() != sr) return .{ .what = "sr", .expected = sr, .actual = c.sr.toInt() };
 
     const pc = s.pc -% pc_prefetch_offset;
     if (c.pc != pc) return .{ .what = "pc", .expected = pc, .actual = c.pc };
@@ -332,15 +265,6 @@ fn compare(s: *const State, c: *const Cpu, bus: *TrackedBus, frame: ?u32) ?Misma
     for (s.ram) |w| {
         const addr: u24 = @truncate(w.addr & even_bus_addr_mask);
         const got = bus.read16(addr);
-        if (frame) |f| {
-            const off = addr -% @as(u24, @truncate(f));
-            switch (off) {
-                frame_ir_offset => continue,
-                ssw_offset => if ((got ^ w.value) & m68k.cpu.ssw_field_mask == 0) continue,
-                frame_sr_offset => if ((got ^ w.value) & sr_ignore_nzvc_mask == 0) continue,
-                else => {},
-            }
-        }
         if (got != w.value) return .{ .what = "ram", .addr = addr, .expected = w.value, .actual = got };
     }
     return null;
@@ -352,20 +276,6 @@ const Tally = struct {
     total: usize = 0,
     state_ok: usize = 0,
     cycles_ok: usize = 0,
-    /// Failed on nothing but the PC in a group 0 frame. See DESIGN.md §5.4.
-    aerr_pc: usize = 0,
-
-    fn add(t: *Tally, o: Tally) void {
-        t.total += o.total;
-        t.state_ok += o.state_ok;
-        t.cycles_ok += o.cycles_ok;
-        t.aerr_pc += o.aerr_pc;
-    }
-
-    /// Failures that are not the known gap. This is what gates the build.
-    fn unexplained(t: Tally) usize {
-        return t.total - t.state_ok - t.aerr_pc;
-    }
 };
 
 fn runFile(src: []const u8, ram: []u8, name: []const u8) !Tally {
@@ -387,17 +297,7 @@ fn runFile(src: []const u8, ram: []u8, name: []const u8) !Tally {
         Core.step(&c, &bus);
 
         tally.total += 1;
-        if (compare(&tc.final, &c, &bus, null)) |strict| {
-            // Retry ignoring the frame fields that come from the prefetch
-            // queue. If those are the only differences it is the known gap,
-            // not a real failure. The relaxed mismatch is the one worth
-            // reporting: the strict one is usually just the frame hiding
-            // whatever else went wrong.
-            const relaxed = if (c.sr.s) compare(&tc.final, &c, &bus, c.a[7]) else strict;
-            const m = relaxed orelse {
-                tally.aerr_pc += 1;
-                continue;
-            };
+        if (compare(&tc.final, &c, &bus)) |m| {
             if (!reported) {
                 reported = true;
                 std.debug.print(
@@ -435,13 +335,6 @@ fn runFile(src: []const u8, ram: []u8, name: []const u8) !Tally {
     return tally;
 }
 
-fn isExcluded(name: []const u8) bool {
-    for (excluded) |e| {
-        if (std.mem.startsWith(u8, name, e)) return true;
-    }
-    return false;
-}
-
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
@@ -464,18 +357,13 @@ pub fn main(init: std.process.Init) !void {
 
     var total = Tally{};
     var files: usize = 0;
-    var skipped: usize = 0;
 
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".json.bin")) continue;
-        if (isExcluded(entry.name)) continue;
         if (filter) |f| {
             if (std.mem.indexOf(u8, entry.name, f) == null) continue;
-        } else if (!isImplemented(entry.name)) {
-            skipped += 1;
-            continue;
         }
 
         const src = dir.readFileAlloc(io, entry.name, gpa, .limited(256 << 20)) catch |err| {
@@ -488,10 +376,12 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("  {s}: {t}\n", .{ entry.name, err });
             continue;
         };
-        std.debug.print("  {s:<24} state {d:>5}/{d:<5} cycles {d:>5}  aerr-pc {d:>5}\n", .{
-            entry.name, t.state_ok, t.total, t.cycles_ok, t.aerr_pc,
+        std.debug.print("  {s:<24} state {d:>5}/{d:<5} cycles {d:>5}\n", .{
+            entry.name, t.state_ok, t.total, t.cycles_ok,
         });
-        total.add(t);
+        total.total += t.total;
+        total.state_ok += t.state_ok;
+        total.cycles_ok += t.cycles_ok;
         files += 1;
     }
 
@@ -502,20 +392,16 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print(
         \\
-        \\{d} files, {d} cases ({d} files skipped: unimplemented families)
-        \\  state:       {d}/{d}
-        \\  cycles:      {d}/{d}
-        \\  aerr-pc:     {d}  (known gap, DESIGN.md §5.4)
-        \\  unexplained: {d}
+        \\{d} files, {d} cases
+        \\  state:  {d}/{d}
+        \\  cycles: {d}/{d}
         \\
     , .{
-        files,               total.total,
-        skipped,             total.state_ok,
-        total.total,         total.cycles_ok,
-        total.total,         total.aerr_pc,
-        total.unexplained(),
+        files,           total.total,
+        total.state_ok,  total.total,
+        total.cycles_ok, total.total,
     });
-    if (total.unexplained() != 0) return error.ConformanceFailed;
+    if (total.state_ok != total.total or total.cycles_ok != total.total) return error.ConformanceFailed;
 }
 
 // ------------------------------------------------------------------------ tests
@@ -544,11 +430,11 @@ test "supervisor state image puts ssp in a7" {
     try std.testing.expectEqual(@as(u32, 0x400), c.pc);
     try std.testing.expectEqual(@as(u16, 0xABCD), bus.read16(0x10));
 
-    try std.testing.expectEqual(@as(?Mismatch, null), compare(&s, &c, &bus, null));
+    try std.testing.expectEqual(@as(?Mismatch, null), compare(&s, &c, &bus));
 
     // A real difference is actually caught.
     s.d[3] = 0xFFFF;
-    try std.testing.expect(compare(&s, &c, &bus, null) != null);
+    try std.testing.expect(compare(&s, &c, &bus) != null);
 }
 
 test "user-mode state image puts usp in a7" {
@@ -562,7 +448,7 @@ test "user-mode state image puts usp in a7" {
 
     try std.testing.expectEqual(@as(u32, 0x1000), c.a[7]);
     try std.testing.expectEqual(@as(u32, 0x8000), c.ssp());
-    try std.testing.expectEqual(@as(?Mismatch, null), compare(&s, &c, &bus, null));
+    try std.testing.expectEqual(@as(?Mismatch, null), compare(&s, &c, &bus));
 }
 
 test "decoder rejects a bad header" {

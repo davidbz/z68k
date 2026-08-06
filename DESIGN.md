@@ -531,60 +531,69 @@ Per test case:
    `final.pc − 4`.
 3. `step()` once.
 4. Compare: d0–d7, a0–a6, both stack pointers, SR, PC, all `final.ram` pairs.
-5. Cycle check: `cpu.cycles == length` — reported as a **separate tier** so
-   state-accuracy progress isn't blocked by timing bugs.
+   Nothing is masked or excused, including every word of an exception frame.
+5. Cycle check: `cpu.cycles == length` — reported as a **separate tier** so a
+   regression says which kind it is.
 
-Exclusions (documented upstream as faulty): `TAS`, `TRAPV`.
+All 127 files run; nothing is excluded or skipped. `TAS` and `TRAPV` were
+excluded for a while on upstream's word (its README calls TAS's read-modify-write
+timing and TRAPV's trigger condition faulty). Measured against this core both
+pass 2500/2500 on both tiers: the divergences were ours — `opTas` never charged
+its EA cost, and `opTrapv` charged a 4-cycle base on top of the trap's own 34.
+A filter argument (`zig build sst -- MOVE`) narrows the run by filename
+substring, nothing else.
 
-Files for families the core does not implement yet are skipped and counted
-(the `implemented` list in `harness.zig`, which grows with each milestone), so
-the gate covers exactly what the core claims to do. Passing an explicit
-filter argument bypasses the list, so a family can be watched while it is
-being implemented.
-
-Reporting is three numbers per file plus the first state failure and the first
-cycle failure in each, with expected-vs-actual detail:
-
-- **state** — full architectural match.
-- **cycles** — of the state-matching cases, how many also matched exactly.
-- **aerr-pc** — cases failing *only* on the prefetch-derived fields of a group 0
-  frame (§5.4). Counted, never silently passed.
-
-The build gates on **unexplained = total − state − aerr-pc**, so a regression
-turns `zig build sst` red while the one known gap stays visible as its own
-number instead of masking everything behind it.
+Reporting is two numbers per file plus the first state failure and the first
+cycle failure in each, with expected-vs-actual detail. The build gates on
+both tiers being complete: every case must match state *and* cycles, so any
+regression turns `zig build sst` red.
 
 ### 5.3 CI
 
 - `zig build test` on every push (existing GitHub Actions).
 - SST harness as a manual/nightly workflow (test data is hundreds of MB).
 
-### 5.4 Known gap: group 0 frame IR field
+### 5.4 Group 0 fault frames
 
-M4 added a real prefetch-queue mark (`Ctx.prefetch`): handlers that can fault
-on a memory access past the point where a real 68000 has already fetched the
-next opcode call `markPrefetch`/set `ctx.prefetch` explicitly at that point,
-and the fault path uses the marked PC instead of the natural one when
-present. This fixed the stacked PC (frame +10) for every family — each
-addressing mode's/instruction's mark point was derived empirically from
-conformance data, the same way the old MOVE-only `start+4∓2n` formula was,
-but per-instruction rather than as one shared rule (the same mode can need a
-different mark depending on which instruction uses it: JSR's `(xxx).w` EA
-marks the post-EA PC, JMP's identical EA marks the pre-EA PC, since one
-pushes a return address into the fault-safe path and the other doesn't). The
-SSW's low five bits and the CCR-masked SR compare are unaffected by this and
-still checked as before.
+The 7-word address-error frame is the one place where "architectural state"
+leaks microcode timing, and it is fully modelled here — no field is excused.
 
-One field resists it: **frame +6, the instruction register.** MAME's IR is
-sometimes the original opcode and sometimes the next prefetched word,
-depending on exact microcode timing that doesn't reduce to "the word at the
-marked PC" — that hypothesis was tried and made results far worse (MOVE.w's
-passing state cases dropped from 2380/2500 to 1013/2500), since most marked
-fault cases keep the *original* opcode in IR, not the next word. Reproducing
-it needs real per-cycle microcode stepping, which is out of scope for the
-prefetch-queue abstraction built here. It's isolated to two files,
-`MOVE.l`/`MOVE.w` (369 + 120 = 489 cases out of 312500, ≈0.16%), and counted
-as `aerr-pc`, never silently passed.
+**PC (+10)** comes from the prefetch mark (`Ctx.prefetch`): handlers that can
+fault past the point where a real 68000 has already fetched the next opcode
+call `markPrefetch`/`markReadFault`, and the fault path uses the marked PC
+instead of the natural one. Each addressing mode's/instruction's mark point
+was derived empirically from conformance data, per instruction rather than as
+one shared rule — the same mode can need a different mark depending on who
+uses it (JSR's `(xxx).w` EA marks the post-EA PC, JMP's identical EA marks
+the pre-EA PC, since one pushes a return address into the fault-safe path and
+the other doesn't).
+
+**IR (+6), and with it the SSW's upper 11 bits of IR residue**, is the opcode
+still executing for every family and every mode but one: a **word-sized MOVE
+to `-(An)`** is slow enough that the next opcode has already been latched by
+fault time, so the frame shows the word at the (unmodified) PC instead. That
+is the only value `Ctx.prefetch.ir` ever overrides, and it costs 4 cycles.
+Long-sized predecrement is not slow enough in the same way, nor is any other
+destination mode. An earlier attempt to apply "the word at the marked PC"
+*unconditionally* is what made this look unmodellable: it dropped MOVE.w from
+2380/2500 to 1013/2500, because most faulting cases do keep the original
+opcode.
+
+**CCR, live and stacked at +8**, freezes wherever MOVE's microcode got to
+before the destination write faulted, which the data pins down per operand
+pair (`opMove`). Byte and word moves have always finished the flag update by
+then. A long move has too, *unless* the destination needed address work the
+source didn't pay for:
+
+| long MOVE, source | destination | what the frame shows |
+|---|---|---|
+| `Dn`/`An`/`#imm` | `(An)`, `(An)+` | CCR untouched |
+| `Dn`/`An`/`#imm` | `d(An)`, `d(An,Xn)` | N and Z from the full long; V/C not yet cleared |
+| memory | `(An)`, `(An)+`, `(xxx).l` | N and Z as if the value were a *word* — the low word is the last thing the source read pushed through the ALU |
+
+Everything else lands the full N/Z/V/C. A long immediate behaves like a
+register source: it arrives as two prefetch words and never crosses the data
+bus into the ALU.
 
 ### 5.5 Milestone gates
 
@@ -593,117 +602,64 @@ as `aerr-pc`, never silently passed.
 | M1 | decode table, MOVE/MOVEA/MOVEQ, harness runs | MOVE* files pass state tier |
 | M2 | ALU families + flags | arithmetic/logic files pass state tier |
 | M3 | shifts, bits, BCD, EXG, MUL/DIV | their files pass state tier |
-| M4 | prefetch queue; remaining exceptions | **all** files pass state tier, `aerr-pc` isolated to a documented remainder |
+| M4 | prefetch queue; remaining exceptions | **all** files pass state tier |
 | M5 | cycle tables tightened | all files pass cycle tier |
 | M6 | TUI debugger | interactive session against a test ROM |
 
-**M1 status** (13 opcode files, 32500 cases; the remaining 112 upstream files
-skipped as unimplemented): `NOP`, `MOVE.b`, `MOVE.q`, `LEA`, `BSR`,
-`ILLEGAL_LINEA` and `ILLEGAL_LINEF` pass 2500/2500 on **both** tiers.
-`MOVE.w/.l`, `MOVEA.w/.l`, `Bcc` and `RTS` account for all 4608 `aerr-pc`
-cases; every case that matches state also matches cycles exactly.
-**Unexplained failures: 0.**
+**Current status: M1–M5 done.** All 127 upstream files, 317500 cases, pass
+both tiers exactly — no exclusions, no skips, no masked fields (§5.2). M6 is
+the only milestone outstanding; `disasm.zig` still prints mnemonics without
+operands.
 
-**M2 status** (66 opcode files, 165000 cases; 61 upstream files skipped as
-unimplemented — M2 is strict ALU, so BCD/MUL/DIV/shifts/bits are left for M3
-and the system-instruction line sharing `0100`'s opcode space for M4/later):
-NEG/NEGX/NOT/CLR/TST, Scc/DBcc, ADD/SUB/AND/OR/EOR/CMP (register, memory and
-address forms), ADDX/SUBX/CMPM, and the immediate/CCR/SR logic group all pass
-state tier. `aerr-pc` climbs to 22273 (the same one documented gap, now hit by
-every family that predecrements/postincrements or reads immediates near a
-misaligned boundary) and cycle-tier pass rate drops for long-sized
-read-modify-write memory destinations (see the note below) — both expected,
-neither gating. **Unexplained failures: 0.**
+The rest of this section records the rules that were derived from conformance
+data rather than from the manual, because the code implementing them looks
+arbitrary without them.
 
-ADDX/SUBX/CMPM's `-(An)`/`(An)+` memory forms turned up bus-timing quirks not
-implied by the single-operand model above: a misaligned access on one operand
-of a two-operand predecrement/postincrement pair can leave *that* operand's
-address register uncommitted while the other, already-succeeded operand's
-register update stands — a per-operand "commit only on your own success" rule,
-rather than the lone-operand model's "always commit, fault after." Long-sized
-CMPM's source additionally partial-commits +2 (not 0, not +4) when its own
-address is odd. These are implemented as instruction-specific bus-order
-comments in `core.zig` (`opAddSubX`, `opCmpm`) rather than generalized into
-`calcEa`, since they don't hold for the single-operand addressing modes that
-function already serves.
-
-**Known cycle-tier gap** (informational, not gating — M2's gate is state tier
-only): the existing compositional cycle model (base cost + EA cost, shared
-with MOVE/LEA) diverges from hardware on a handful of long-sized
-read-modify-write and memory-destination forms, in both directions — e.g.
-`CLR.l (A3)+` is 58 cycles on hardware, 64 from the model (overcounts);
-`SUB.l D4, -(A6)` is 22 on hardware, 14 from the model (undercounts). Left as
-compositional-but-imperfect for consistency until M5 tightens cycle tables
-per instruction, rather than hand-tuning constants now (resolved — see M5
-status below).
-
-**M3 status** (104 opcode files, 260000 cases; 21 upstream files skipped as
-unimplemented — the remaining system-instruction/TRAP/CHK line for M4):
-ASx/LSx/ROx/ROXx (register and memory forms), BTST/BCHG/BCLR/BSET (static and
-dynamic), MOVEP, ABCD/SBCD/NBCD, EXG, and MULU/MULS/DIVU/DIVS all pass state
-tier. `aerr-pc` climbs to 25970 (same documented gap); cycle tier trails
-state tier further here than in M2, since MULU/MULS's operand-dependent cost
-and DIVU/DIVS's `140+` computed cost (§4.8) are only roughly modelled (resolved
-— see M5 status below). **Unexplained failures: 0.**
-
-Two BCD flag rules and one DIVU/DIVS flag rule were pinned down empirically
-against conformance data rather than the manual, which leaves them
-undefined: ABCD's decimal carry threshold is `res > 0x9F`, not the `> 0x99`
-textbook DAA threshold; SBCD's C/X output is a strictly more inclusive
-condition than the one gating its value's high-nibble correction (it also
+**Flags.** ABCD's decimal carry threshold is `res > 0x9F`, not the `> 0x99`
+textbook DAA threshold. SBCD's C/X output is a strictly more inclusive
+condition than the one gating its value's high-nibble correction: it also
 fires when the raw operands are exactly equal but a low-nibble borrow still
-occurs); and DIVU/DIVS set N unconditionally on quotient overflow, regardless
-of the (discarded) quotient's actual sign. See `flags.zig`'s `bcdAdd`/`bcdSub`
-and `core.zig`'s `opDiv` for the derivations.
+occurs. DIVU/DIVS set N unconditionally on quotient overflow, regardless of
+the (discarded) quotient's actual sign. See `flags.zig`'s `bcdAdd`/`bcdSub`
+and `core.zig`'s `opDivu`/`opDivs`. MOVE's fault-time CCR staging is in §5.4.
 
-**M4 status** (125 opcode files, 312500 cases; 0 upstream files skipped —
-every implemented family from the ISA now has a handler): CHK, EXT.w/l,
-JMP, JSR, LINK/UNLK, MOVE to/from CCR/SR, MOVE to/from USP, MOVEM.w/l, PEA,
-RESET, RTE, RTR, STOP, SWAP, TAS, TRAP, TRAPV round out the `0100` opcode
-line's remaining handlers, and the `Ctx.prefetch` mark (§5.4) rolled out
-across every family with a nonzero `aerr-pc`. **All 125 files pass the state
-tier with zero unexplained failures.** `aerr-pc` is 489 (down from a peak of
-~26000 pre-rollout), entirely confined to MOVE.l/MOVE.w's IR field — the one
-gap that resisted the mark mechanism (§5.4).
+**Bus order.** ADDX/SUBX/CMPM's `-(An)`/`(An)+` forms follow a per-operand
+"commit only on your own success" rule: a misaligned access on one operand can
+leave *that* operand's address register uncommitted while the other,
+already-succeeded operand's update stands — unlike the single-operand model's
+"always commit, fault after." Long-sized CMPM's source additionally
+partial-commits +2 (not 0, not +4) when its own address is odd. These live as
+instruction-specific code in `opAddSubX`/`opCmpm` rather than in `calcEa`,
+since they don't hold for the single-operand modes that function serves.
 
-Several control-flow families needed bespoke, instruction-specific mark
-points rather than a mode-keyed rule in `calcEa`, mirroring M2/M3's
-ADDX/SUBX/CMPM pattern: JMP marks the pre-EA PC while JSR (identical
+**Prefetch marks.** Several control-flow families need bespoke mark points
+rather than a mode-keyed rule: JMP marks the pre-EA PC while JSR (identical
 addressing modes) marks the post-EA PC, since JSR's return-address push
 changes what the fault-safe path should show; BRA/Bcc-taken mark their own
 pre-branch PC ("as if the branch had never been attempted") while BSR keeps
 the target, since only BSR also pushes a return address; DBcc's mandatory
 16-bit displacement fetch marks the natural post-fetch PC, unlike Bcc's
-optional 8-bit form; RTS/RTE/RTR all mark their own pre-jump PC rather than
-the popped target; MOVEM marks once per instruction (after its mask word
-and any EA extension words), applied uniformly to whichever register in the
-transfer list actually faults.
+optional 8-bit form; RTS/RTE/RTR mark their own pre-jump PC rather than the
+popped target; MOVEM marks once per instruction, applied to whichever
+register in the transfer list actually faults.
 
-**M5 status** (same 125 files, 312500 cases): the cycle tier now passes
-everywhere the state tier does — 312011/312500, exactly matching state, with
-the remaining 489 gap entirely `aerr-pc` (§5.4, unchanged). **Unexplained
-failures: 0.**
+**Cycles.** The compositional model (base + EA cost) needed three
+instruction-specific corrections to reach the cycle tier:
 
-Three families accounted for the whole gap from M4, each needing a different
-fix rather than one shared correction:
-
-- **DIVU/DIVS**: the placeholder cost from M3 (§4.8) is gone. Both are now a
-  direct port of Jorge Cwik's cycle-accurate simulation of the divide
-  microcode — a 15-iteration bit-serial restoring-division loop
-  (`divuCycles`/`divsCycles` in `core.zig`) — rather than any closed-form
-  table, since the real hardware's cost is genuinely data-dependent on the
-  dividend/divisor bit pattern, not just their magnitudes.
-- **MOVEfromSR**'s memory form used MOVE's predecrement-discounted
-  `destCycles` table by analogy, but it isn't a MOVE-shaped write: it reads
-  the destination first (same as `MOVEtoCCR`), so it needed the full `cycles`
-  table plus a flat `-4` fault correction, not the discount.
-- **MOVE**'s destination-fault correction is flat `-4` for every non-`abs_long`
-  EA at every size, and for `abs_long` itself at long size — matching the
-  single-operand fault table used everywhere else in the core. `abs_long` at
-  word/byte size is the one real exception: it only needs the `-4` when the
-  source operand cost the bus a cycle of its own (anything but a free `Dn`/`An`
-  read), since `abs_long`'s two extension words then overlap that prior access
-  differently than they would after a free register read.
+- **DIVU/DIVS** are a direct port of Jorge Cwik's cycle-accurate simulation of
+  the divide microcode — a 15-iteration bit-serial restoring-division loop
+  (`divuCycles`/`divsCycles`) — not a closed-form table, since the real cost
+  is data-dependent on the dividend/divisor bit pattern, not just magnitude.
+- **MOVEfromSR**'s memory form is not a MOVE-shaped write: it reads the
+  destination first (like `MOVEtoCCR`), so it uses the full `cycles` table
+  plus a flat `-4` fault correction, not `destCycles`' predecrement discount.
+- **MOVE**'s destination-fault correction is `-4` at long size, plus a further
+  `-4` for `abs_long` at any size once the source read used the bus (anything
+  but a free `Dn`/`An`), since its two extension words then overlap that
+  access differently. `-(An)` gives nothing back — it pays its full cost even
+  when it faults, its first access being the one `destCycles`' discount covers
+  — and at word size it *adds* 4 for the next-opcode prefetch that the same
+  fault makes visible in IR (§5.4).
 
 ## 6. References
 
