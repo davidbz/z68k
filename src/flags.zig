@@ -192,76 +192,52 @@ pub fn shift(kind: ShiftKind, value: u32, count: u6, size: Size, x_in: bool) Shi
     const msb = size.msb();
     var carry: bool = x_in;
     var overflow = false;
+    var x = x_in; // threaded through by roxl/roxr only
 
-    switch (kind) {
-        .asl => {
-            var i: u6 = 0;
-            while (i < count) : (i += 1) {
+    for (0..count) |_| {
+        switch (kind) {
+            .asl => {
                 const before = v & msb != 0;
                 carry = before;
                 v = (v << 1) & mask;
                 if (before != (v & msb != 0)) overflow = true;
-            }
-        },
-        .lsl => {
-            var i: u6 = 0;
-            while (i < count) : (i += 1) {
+            },
+            .lsl => {
                 carry = v & msb != 0;
                 v = (v << 1) & mask;
-            }
-        },
-        .asr => {
-            const sign = v & msb != 0;
-            var i: u6 = 0;
-            while (i < count) : (i += 1) {
+            },
+            .asr => {
+                const sign = v & msb != 0;
                 carry = v & 1 != 0;
                 v = ((v >> 1) | (if (sign) msb else 0)) & mask;
-            }
-        },
-        .lsr => {
-            var i: u6 = 0;
-            while (i < count) : (i += 1) {
+            },
+            .lsr => {
                 carry = v & 1 != 0;
                 v = (v >> 1) & mask;
-            }
-        },
-        .rol => {
-            var i: u6 = 0;
-            while (i < count) : (i += 1) {
+            },
+            .rol => {
                 const out = v & msb != 0;
                 v = ((v << 1) | @intFromBool(out)) & mask;
                 carry = out;
-            }
-        },
-        .ror => {
-            var i: u6 = 0;
-            while (i < count) : (i += 1) {
+            },
+            .ror => {
                 const out = v & 1 != 0;
                 v = ((v >> 1) | (if (out) msb else 0)) & mask;
                 carry = out;
-            }
-        },
-        .roxl => {
-            var x = x_in;
-            var i: u6 = 0;
-            while (i < count) : (i += 1) {
+            },
+            .roxl => {
                 const out = v & msb != 0;
                 v = ((v << 1) | @intFromBool(x)) & mask;
                 x = out;
-            }
-            carry = x;
-        },
-        .roxr => {
-            var x = x_in;
-            var i: u6 = 0;
-            while (i < count) : (i += 1) {
+            },
+            .roxr => {
                 const out = v & 1 != 0;
                 v = ((v >> 1) | (if (x) msb else 0)) & mask;
                 x = out;
-            }
-            carry = x;
-        },
+            },
+        }
     }
+    if (kind == .roxl or kind == .roxr) carry = x;
 
     return .{
         .value = v,

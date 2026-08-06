@@ -142,9 +142,9 @@ pub fn Core(comptime BusT: type) type {
         }
 
         fn write32(ctx: *Ctx, addr: u32, v: u32) Fault!void {
-            // TODO(M2): -(An) destinations write the low word first on real
-            // hardware. Only observable through a bus-error frame, which we do
-            // not model yet.
+            // -(An) writes low word first on real hardware; unobservable here
+            // since calcEa's predecrement check already faults (at addr+2,
+            // matching that ordering) before either word is written.
             try write16(ctx, addr, @truncate(v >> 16));
             try write16(ctx, addr +% 2, @truncate(v));
         }
@@ -362,6 +362,33 @@ pub fn Core(comptime BusT: type) type {
             const m = size.mask();
             dst.* = (dst.* & ~m) | (v & m);
         }
+
+        /// A read-modify-write operand, holding wherever it was read from
+        /// (register or memory address) alongside the value read. This is a
+        /// read-modify-write, but the first bus cycle is a read: `read`
+        /// passes write=false to `calcEa` so postinc/predec's fault-timing
+        /// and register-writeback rules match a plain read (real hardware
+        /// increments/decrements the register on the read side, then reuses
+        /// the same address for the write with no further side effect).
+        const RmwOperand = struct {
+            loc: union(enum) { reg: u3, mem: u32 },
+            old: u32,
+
+            fn read(ctx: *Ctx, mode: EaMode, reg: u3, size: Size) Fault!RmwOperand {
+                if (mode == .data_reg) {
+                    return .{ .loc = .{ .reg = reg }, .old = ctx.cpu.d[reg] & size.mask() };
+                }
+                const addr = try calcEa(ctx, mode, reg, size, false);
+                return .{ .loc = .{ .mem = addr }, .old = try readAt(ctx, addr, size, false) };
+            }
+
+            fn writeBack(o: RmwOperand, ctx: *Ctx, size: Size, v: u32) Fault!void {
+                switch (o.loc) {
+                    .reg => |r| setReg(&ctx.cpu.d[r], size, v),
+                    .mem => |addr| try writeAt(ctx, addr, size, v),
+                }
+            }
+        };
 
         /// A `Dn`/`An`/immediate source never risks a fault: the read is
         /// always a register access or the instruction stream itself.
@@ -704,19 +731,8 @@ pub fn Core(comptime BusT: type) type {
             errdefer if (size == .long) {
                 ctx.cpu.cycles -= 4;
             };
-            var addr: u32 = undefined;
-            const old: u32 = if (mode == .data_reg)
-                ctx.cpu.d[reg] & size.mask()
-            else blk: {
-                // This is a read-modify-write, but the first bus cycle is a
-                // read: pass write=false so postinc/predec's fault-timing and
-                // register-writeback rules match a plain read (real hardware
-                // increments/decrements the register on the read side, then
-                // reuses the same address for the write with no further
-                // side effect).
-                addr = try calcEa(ctx, mode, reg, size, false);
-                break :blk try readAt(ctx, addr, size, false);
-            };
+            const operand = try RmwOperand.read(ctx, mode, reg, size);
+            const old = operand.old;
 
             const x_in = ctx.cpu.sr.x;
             const old_z = ctx.cpu.sr.z;
@@ -750,11 +766,7 @@ pub fn Core(comptime BusT: type) type {
                 ctx.cpu.cycles += alu_extra + rmw_extra;
             }
 
-            if (mode == .data_reg) {
-                setReg(&ctx.cpu.d[reg], size, r.value);
-            } else {
-                try writeAt(ctx, addr, size, r.value);
-            }
+            try operand.writeBack(ctx, size, r.value);
 
             switch (mn) {
                 .clr, .not => ctx.cpu.sr.setNzvc(r.cc),
@@ -786,24 +798,18 @@ pub fn Core(comptime BusT: type) type {
             errdefer if (size == .long) {
                 ctx.cpu.cycles -= 4;
             };
-            var addr: u32 = undefined;
-            const old: u32 = if (mode == .data_reg)
-                ctx.cpu.d[reg] & size.mask()
-            else blk: {
-                addr = try calcEa(ctx, mode, reg, size, false);
-                break :blk try readAt(ctx, addr, size, false);
-            };
+            const operand = try RmwOperand.read(ctx, mode, reg, size);
+            const old = operand.old;
 
             const cc = if (is_sub) flags.sub(old, data, size) else flags.add(old, data, size);
             const result = (if (is_sub) old -% data else old +% data) & size.mask();
 
             if (mode == .data_reg) {
                 if (size == .long) ctx.cpu.cycles += 4;
-                setReg(&ctx.cpu.d[reg], size, result);
             } else {
                 ctx.cpu.cycles += if (size == .long) @as(u8, 8) else 4;
-                try writeAt(ctx, addr, size, result);
             }
+            try operand.writeBack(ctx, size, result);
             ctx.cpu.sr.setNzvcx(cc);
         }
 
@@ -901,74 +907,74 @@ pub fn Core(comptime BusT: type) type {
             const dn: u3 = @truncate(op >> 9);
             const ea_mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
             const ea_reg: u3 = @truncate(op);
-
             const is_re = switch (mn) {
                 .cmp => false,
                 .eor => true,
                 else => op & 0x0100 != 0,
             };
-
-            if (!is_re) {
-                // Dn = Dn op ea (or, for CMP, just Dn - ea into the flags).
-                // Charged as the word-sized form; a faulting read never
-                // reaches long's extra ALU pass, added below only once the
-                // read has actually succeeded.
-                ctx.cpu.cycles += ea_mode.cycles(size);
-                errdefer if (size == .long) {
-                    ctx.cpu.cycles -= 4;
-                };
-                const src = try readEa(ctx, ea_mode, ea_reg, size);
-                if (size == .long) {
-                    // A register or immediate source never risks a fault, so
-                    // it takes the full register-destination long bonus (4,
-                    // or 2 for CMP, which never writes back); a real memory
-                    // read instead takes a flat 2, the rest of that bonus
-                    // already spent on the read itself.
-                    const no_fault = noFaultSource(ea_mode);
-                    ctx.cpu.cycles += if (no_fault) (if (mn == .cmp) @as(u8, 2) else 4) else 2;
-                }
-                const dst = ctx.cpu.d[dn] & size.mask();
-
-                switch (mn) {
-                    .cmp => ctx.cpu.sr.setNzvc(flags.sub(dst, src, size)),
-                    .add => {
-                        const cc = flags.add(dst, src, size);
-                        setReg(&ctx.cpu.d[dn], size, (dst +% src) & size.mask());
-                        ctx.cpu.sr.setNzvcx(cc);
-                    },
-                    .sub => {
-                        const cc = flags.sub(dst, src, size);
-                        setReg(&ctx.cpu.d[dn], size, (dst -% src) & size.mask());
-                        ctx.cpu.sr.setNzvcx(cc);
-                    },
-                    .and_, .or_ => {
-                        const v = if (mn == .and_) dst & src else dst | src;
-                        setReg(&ctx.cpu.d[dn], size, v);
-                        ctx.cpu.sr.setNzvc(flags.logic(v, size));
-                    },
-                    else => unreachable,
-                }
-                return;
+            if (is_re) {
+                try opAlu2ToEa(ctx, mn, size, dn, ea_mode, ea_reg);
+            } else {
+                try opAlu2ToReg(ctx, mn, size, dn, ea_mode, ea_reg);
             }
+        }
 
-            // ea = ea op Dn. Read-modify-write in shape only for a memory ea;
-            // EOR's ea may also be Dn, a plain register-register op. Charged
-            // as the word-sized, register-destination form; a faulting read
-            // never reaches long's extra ALU pass or a memory destination's
-            // write-back extra, both added below only once the read has
-            // actually succeeded.
+        // Dn = Dn op ea (or, for CMP, just Dn - ea into the flags).
+        fn opAlu2ToReg(ctx: *Ctx, mn: decode.Mnemonic, size: Size, dn: u3, ea_mode: EaMode, ea_reg: u3) Fault!void {
+            // Charged as the word-sized form; a faulting read never
+            // reaches long's extra ALU pass, added below only once the
+            // read has actually succeeded.
+            ctx.cpu.cycles += ea_mode.cycles(size);
+            errdefer if (size == .long) {
+                ctx.cpu.cycles -= 4;
+            };
+            const src = try readEa(ctx, ea_mode, ea_reg, size);
+            if (size == .long) {
+                // A register or immediate source never risks a fault, so
+                // it takes the full register-destination long bonus (4,
+                // or 2 for CMP, which never writes back); a real memory
+                // read instead takes a flat 2, the rest of that bonus
+                // already spent on the read itself.
+                const no_fault = noFaultSource(ea_mode);
+                ctx.cpu.cycles += if (no_fault) (if (mn == .cmp) @as(u8, 2) else 4) else 2;
+            }
+            const dst = ctx.cpu.d[dn] & size.mask();
+
+            switch (mn) {
+                .cmp => ctx.cpu.sr.setNzvc(flags.sub(dst, src, size)),
+                .add => {
+                    const cc = flags.add(dst, src, size);
+                    setReg(&ctx.cpu.d[dn], size, (dst +% src) & size.mask());
+                    ctx.cpu.sr.setNzvcx(cc);
+                },
+                .sub => {
+                    const cc = flags.sub(dst, src, size);
+                    setReg(&ctx.cpu.d[dn], size, (dst -% src) & size.mask());
+                    ctx.cpu.sr.setNzvcx(cc);
+                },
+                .and_, .or_ => {
+                    const v = if (mn == .and_) dst & src else dst | src;
+                    setReg(&ctx.cpu.d[dn], size, v);
+                    ctx.cpu.sr.setNzvc(flags.logic(v, size));
+                },
+                else => unreachable,
+            }
+        }
+
+        // ea = ea op Dn. Read-modify-write in shape only for a memory ea;
+        // EOR's ea may also be Dn, a plain register-register op.
+        fn opAlu2ToEa(ctx: *Ctx, mn: decode.Mnemonic, size: Size, dn: u3, ea_mode: EaMode, ea_reg: u3) Fault!void {
+            // Charged as the word-sized, register-destination form; a
+            // faulting read never reaches long's extra ALU pass or a memory
+            // destination's write-back extra, both added below only once
+            // the read has actually succeeded.
             ctx.cpu.cycles += ea_mode.cycles(size);
             errdefer if (size == .long) {
                 ctx.cpu.cycles -= 4;
             };
             const src = ctx.cpu.d[dn] & size.mask();
-            var addr: u32 = undefined;
-            const old: u32 = if (ea_mode == .data_reg)
-                ctx.cpu.d[ea_reg] & size.mask()
-            else blk: {
-                addr = try calcEa(ctx, ea_mode, ea_reg, size, false);
-                break :blk try readAt(ctx, addr, size, false);
-            };
+            const operand = try RmwOperand.read(ctx, ea_mode, ea_reg, size);
+            const old = operand.old;
 
             const kind: AluOp = switch (mn) {
                 .add => .add,
@@ -985,11 +991,10 @@ pub fn Core(comptime BusT: type) type {
                 // usual 2, since the register is read and written in the
                 // same cycle slot.
                 if (size == .long) ctx.cpu.cycles += if (mn == .eor) @as(u8, 4) else 2;
-                setReg(&ctx.cpu.d[ea_reg], size, r.value);
             } else {
                 ctx.cpu.cycles += if (size == .long) @as(u8, 8) else 4;
-                try writeAt(ctx, addr, size, r.value);
             }
+            try operand.writeBack(ctx, size, r.value);
             if (r.affects_x) ctx.cpu.sr.setNzvcx(r.cc) else ctx.cpu.sr.setNzvc(r.cc);
         }
 
@@ -1183,13 +1188,8 @@ pub fn Core(comptime BusT: type) type {
             errdefer if (size == .long) {
                 ctx.cpu.cycles -= 4;
             };
-            var addr: u32 = undefined;
-            const old: u32 = if (mode == .data_reg)
-                ctx.cpu.d[reg] & size.mask()
-            else blk: {
-                addr = try calcEa(ctx, mode, reg, size, false);
-                break :blk try readAt(ctx, addr, size, false);
-            };
+            const operand = try RmwOperand.read(ctx, mode, reg, size);
+            const old = operand.old;
 
             const kind: AluOp = switch (mn) {
                 .ori => .or_,
@@ -1211,13 +1211,7 @@ pub fn Core(comptime BusT: type) type {
                 ctx.cpu.cycles += if (size == .long) @as(u8, 8) else 4;
             }
 
-            if (r.writes) {
-                if (mode == .data_reg) {
-                    setReg(&ctx.cpu.d[reg], size, r.value);
-                } else {
-                    try writeAt(ctx, addr, size, r.value);
-                }
-            }
+            if (r.writes) try operand.writeBack(ctx, size, r.value);
             if (r.affects_x) ctx.cpu.sr.setNzvcx(r.cc) else ctx.cpu.sr.setNzvc(r.cc);
         }
 
@@ -1226,41 +1220,32 @@ pub fn Core(comptime BusT: type) type {
         /// the immediate word is even fetched.
         fn opImmediateSr(ctx: *Ctx, instr: decode.Instr) Fault!void {
             const mn = instr.mnemonic;
-            switch (mn) {
-                .ori_sr, .andi_sr, .eori_sr => if (!ctx.cpu.sr.s) {
-                    ctx.cpu.cycles -= instr.base_cycles;
-                    return Fault.PrivilegeViolation;
-                },
-                else => {},
-            }
-            const imm = try fetch16(ctx);
+            const is_sr = switch (mn) {
+                .ori_sr, .andi_sr, .eori_sr => true,
+                else => false,
+            };
 
-            switch (mn) {
-                .ori_ccr, .andi_ccr, .eori_ccr => {
-                    const old: u16 = ctx.cpu.sr.toInt() & 0xFF;
-                    const v: u16 = switch (mn) {
-                        .ori_ccr => old | (imm & 0xFF),
-                        .andi_ccr => old & (imm & 0xFF),
-                        .eori_ccr => old ^ (imm & 0xFF),
-                        else => unreachable,
-                    };
-                    const full = (ctx.cpu.sr.toInt() & 0xFF00) | v;
-                    ctx.cpu.sr = cpu_mod.StatusRegister.fromInt(full);
-                },
-                .ori_sr, .andi_sr, .eori_sr => {
-                    const old = ctx.cpu.sr.toInt();
-                    const v: u16 = switch (mn) {
-                        .ori_sr => old | imm,
-                        .andi_sr => old & imm,
-                        .eori_sr => old ^ imm,
-                        else => unreachable,
-                    };
-                    const new_sr = cpu_mod.StatusRegister.fromInt(v);
-                    ctx.cpu.setSupervisor(new_sr.s);
-                    ctx.cpu.sr = new_sr;
-                },
-                else => unreachable,
+            if (is_sr and !ctx.cpu.sr.s) {
+                ctx.cpu.cycles -= instr.base_cycles;
+                return Fault.PrivilegeViolation;
             }
+
+            var imm = try fetch16(ctx);
+            if (!is_sr) imm &= 0xFF;
+
+            const old = ctx.cpu.sr.toInt();
+            const result: u16 = switch (mn) {
+                .ori_ccr, .ori_sr => old | imm,
+                .andi_ccr, .andi_sr => old & imm,
+                .eori_ccr, .eori_sr => old ^ imm,
+                else => unreachable,
+            };
+            // CCR forms only ever touch the low byte; the upper byte (incl. S) carries over untouched.
+            const v = if (is_sr) result else (old & 0xFF00) | (result & 0xFF);
+
+            const new_sr = cpu_mod.StatusRegister.fromInt(v);
+            if (is_sr) ctx.cpu.setSupervisor(new_sr.s);
+            ctx.cpu.sr = new_sr;
         }
 
         /// A long read at a predecrement address used by ADDX/SUBX's memory
@@ -1941,20 +1926,11 @@ pub fn Core(comptime BusT: type) type {
         fn opTas(ctx: *Ctx, op: u16) Fault!void {
             const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
             const reg: u3 = @truncate(op);
-            var addr: u32 = undefined;
-            const old: u8 = if (mode == .data_reg)
-                @truncate(ctx.cpu.d[reg])
-            else blk: {
-                addr = try calcEa(ctx, mode, reg, .byte, false);
-                break :blk @truncate(try readAt(ctx, addr, .byte, false));
-            };
+            const operand = try RmwOperand.read(ctx, mode, reg, .byte);
+            const old: u8 = @truncate(operand.old);
             ctx.cpu.sr.setNzvc(flags.logic(old, .byte));
             const new_v = old | 0x80;
-            if (mode == .data_reg) {
-                setReg(&ctx.cpu.d[reg], .byte, new_v);
-            } else {
-                try writeAt(ctx, addr, .byte, new_v);
-            }
+            try operand.writeBack(ctx, .byte, new_v);
         }
 
         /// MOVEM: register list <-> memory. Every mode but predecrement maps
@@ -2019,9 +1995,12 @@ pub fn Core(comptime BusT: type) type {
                 if (load) {
                     const v = signExtend(try readAt(ctx, cur, size, mode.isProgram()), size);
                     // (An)+ loading An itself: the auto-incremented address
-                    // calcEa already wrote into An wins over the value just
-                    // read from memory, unlike the reverse (store) case.
-                    if (is_addr and rn == reg and postinc) {} else if (is_addr) ctx.cpu.a[rn] = v else setReg(&ctx.cpu.d[rn], .long, v);
+                    // movemStep already wrote into An wins over the value
+                    // just read from memory, unlike the reverse (store) case.
+                    const skip_writeback = is_addr and rn == reg and postinc;
+                    if (!skip_writeback) {
+                        if (is_addr) ctx.cpu.a[rn] = v else setReg(&ctx.cpu.d[rn], .long, v);
+                    }
                 } else {
                     // -(An) storing An itself: real hardware stores the
                     // register's value from *before* the instruction
