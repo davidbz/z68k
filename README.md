@@ -33,7 +33,8 @@ TRAPV — plus the exception machinery and data-dependent divide timing.
 
 - Zig 0.16.0
 
-No other dependencies.
+The library has no dependencies. The Genesis example draws with raylib, which
+the build fetches on demand; nothing else links it.
 
 ## Building
 
@@ -91,6 +92,32 @@ A Kickstart ROM boots here too, but there is nothing to watch: it puts its
 output on the screen, and there are no bitplanes and no vertical-blank
 interrupt for exec to run on.
 
+## Playing a Genesis game
+
+`examples/genesis.zig` is the machine the core was written for: cartridge,
+64 KiB of work RAM, a controller, the interrupt and frame timing, and a VDP
+(`examples/genesis_vdp.zig`) that renders both planes, the window and sprites
+a scanline at a time, with all three DMA modes. The Z80, YM2612 and PSG are
+stubs — silent, but present enough that the ROM's handshakes complete. Put a
+ROM in `roms/` (gitignored) and:
+
+```sh
+zig build genesis -Doptimize=ReleaseFast              # roms/Sonic-the-Hedgehog.bin
+zig build genesis -Doptimize=ReleaseFast -- other.bin
+zig build genesis -- --shot 600 shot.png              # headless: N frames, then a PNG
+```
+
+Keys: arrows, A/S/D for A/B/C, Enter for Start.
+
+Sonic 1 runs from the reset vector through the Sega logo, the title screen and
+the attract-mode demo into Green Hill Zone, with parallax scroll, line-scrolled
+water, sprites and the HUD on the window plane — around 13x real time on a
+laptop. The `--shot` mode needs no display at all, which makes "does frame N
+still look right" a check you can run anywhere.
+
+Deliberately absent: sound, shadow/highlight, interlace, H32 mode, and the
+per-line sprite limits. Nothing in Sonic 1 uses them.
+
 ## Using the library
 
 The core is a dependency-free Zig module named `m68k`. It never allocates; the
@@ -124,6 +151,8 @@ src/flags.zig      condition-code computation               (pure fns)
 src/core.zig       Core(BusT): step/run/reset/EA/exceptions (logic)
 src/harness.zig    SingleStepTests conformance runner
 examples/amiga.zig   minimal A500 memory map, for booting real ROMs
+examples/genesis.zig     Genesis bus, timing, input, raylib window
+examples/genesis_vdp.zig VDP ports, DMA and scanline renderer
 src/system_test.zig  interrupts, STOP, trace, reset, halted   (sequences)
 src/fuzz_test.zig    step() vs. a contract-checking bus       (invariants)
 ```

@@ -3,7 +3,14 @@
     .version = "0.0.0",
     .fingerprint = 0xc8df02eddbc88817,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        // Only the Genesis example needs it; `zig build test` never fetches it.
+        .raylib = .{
+            .url = "git+https://github.com/raysan5/raylib#a55d49b754fa157a539666d772135bdb26ae9da0",
+            .hash = "raylib-6.0.0-whq8uAYyPAW1tLAXFW3-RSAAkdqivRstBPwsCqjQEbd1",
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

@@ -60,6 +60,14 @@ pub fn build(b: *std.Build) void {
     b.step("sst", "Run the SingleStepTests conformance suite (needs testdata/)")
         .dependOn(&sst_run.step);
 
+    // The VDP has no dependency on raylib, so its own tests ride along here.
+    const vdp_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("examples/genesis_vdp.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(vdp_tests).step);
+
     // --- examples ------------------------------------------------------------
     const amiga = b.addExecutable(.{ .name = "z68k-amiga", .root_module = b.createModule(.{
         .root_source_file = b.path("examples/amiga.zig"),
@@ -75,4 +83,34 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| amiga_run.addArgs(args);
     b.step("amiga", "Boot an Amiga ROM (needs roms/; see examples/amiga.zig)")
         .dependOn(&amiga_run.step);
+
+    // The Genesis example draws with raylib, the only dependency in the tree.
+    // It hangs off its own step and is never installed, so nothing else builds
+    // or links it. The dependency is lazy, but the build runner still fetches
+    // it once for any build after a fresh clone: a build script cannot see
+    // which step was asked for, so the call above happens either way.
+    const genesis_step = b.step("genesis", "Run a Genesis ROM (needs roms/ and raylib)");
+    if (b.lazyDependency("raylib", .{
+        .target = target,
+        .optimize = optimize,
+        .raudio = false, // no sound emulation here, so nothing to play it with
+        .rmodels = false,
+    })) |raylib_dep| {
+        const genesis = b.addExecutable(.{
+            .name = "z68k-genesis",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/genesis.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true, // raylib.h comes in through @cImport
+                .imports = &.{.{ .name = "m68k", .module = m68k }},
+            }),
+        });
+        genesis.root_module.linkLibrary(raylib_dep.artifact("raylib"));
+
+        const genesis_run = b.addRunArtifact(genesis);
+        genesis_run.setCwd(b.path("."));
+        if (b.args) |args| genesis_run.addArgs(args);
+        genesis_step.dependOn(&genesis_run.step);
+    }
 }
