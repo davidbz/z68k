@@ -36,25 +36,4 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| sst_run.addArgs(args);
     b.step("sst", "Run the SingleStepTests conformance suite (needs testdata/)")
         .dependOn(&sst_run.step);
-
-    // --- debugger TUI -------------------------------------------------------
-    const dbg = b.addExecutable(.{
-        .name = "z68k-dbg",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tui/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "m68k", .module = m68k }},
-        }),
-    });
-
-    if (b.lazyDependency("vaxis", .{ .target = target, .optimize = optimize })) |vaxis| {
-        dbg.root_module.addImport("vaxis", vaxis.module("vaxis"));
-    }
-    b.installArtifact(dbg);
-
-    const dbg_run = b.addRunArtifact(dbg);
-    dbg_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| dbg_run.addArgs(args);
-    b.step("dbg", "Run the debugger TUI").dependOn(&dbg_run.step);
 }

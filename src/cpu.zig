@@ -160,7 +160,7 @@ pub const Group0Info = struct {
 };
 
 /// The entire CPU state. Plain and copyable: `const snapshot = cpu.*` is a
-/// complete save state, which is what the debugger's step-back uses.
+/// complete save state.
 pub const Cpu = struct {
     d: [8]u32 = @splat(0),
     /// a[7] is always the *active* stack pointer for the current privilege mode.
@@ -189,8 +189,8 @@ pub const Cpu = struct {
         cpu.sr.s = s;
     }
 
-    /// Supervisor stack pointer regardless of current mode. For debuggers and
-    /// the test harness, which name both stacks explicitly.
+    /// Supervisor stack pointer regardless of current mode. For the test
+    /// harness, which names both stacks explicitly.
     pub fn ssp(cpu: *const Cpu) u32 {
         return if (cpu.sr.s) cpu.a[7] else cpu.usp;
     }
