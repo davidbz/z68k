@@ -139,6 +139,17 @@ pub const Exception = enum(u8) {
     }
 };
 
+/// Special status word layout for the group 0 exception frame: R/W, I/N and
+/// the three FC pins live in the low bits; bits 5..15 are undefined on
+/// hardware but MAME leaves the instruction register there, so tests check it.
+pub const ssw_rw_read: u16 = 0x10;
+pub const ssw_fc_program: u16 = 0x2;
+pub const ssw_fc_data: u16 = 0x1;
+pub const ssw_fc_supervisor: u16 = 0x4;
+pub const ssw_ir_residue_mask: u16 = 0xFFE0;
+/// R/W + FC occupy the low 5 bits; the rest is prefetch/IR residue.
+pub const ssw_field_mask: u16 = 0x1F;
+
 /// Extra state pushed by a group 0 (bus/address error) exception frame.
 pub const Group0Info = struct {
     access_addr: u32,

@@ -26,6 +26,7 @@ const test_dir = "testdata/v1";
 /// bytes ahead of where execution actually begins. Everything else in the state
 /// image is literal.
 const pc_prefetch_offset = 4;
+const even_bus_addr_mask = 0xFF_FFFE;
 
 /// Verified faulty upstream: TAS does not model its read-modify-write timing,
 /// and TRAPV triggers on the wrong condition.
@@ -82,6 +83,7 @@ const magic_test = 0xABC12367;
 const magic_name = 0x89ABCDEF;
 const magic_state = 0x01234567;
 const magic_transactions = 0x456789AB;
+const transaction_payload_bytes = 20; // fc, addr, data, UDS, LDS
 
 const DecodeError = error{ Truncated, BadMagic, TooManyRamWords };
 
@@ -212,7 +214,7 @@ const Decoder = struct {
             const kind = try d.r.u8_();
             _ = try d.r.u32_(); // cycles for this transaction
             if (kind == 0) continue; // idle
-            _ = try d.r.bytes(20); // fc, addr, data, UDS, LDS
+            _ = try d.r.bytes(transaction_payload_bytes);
         }
         return cycles;
     }
@@ -274,8 +276,24 @@ fn load(s: *const State, c: *Cpu, bus: *TrackedBus) void {
     c.a = .{ s.a[0], s.a[1], s.a[2], s.a[3], s.a[4], s.a[5], s.a[6], if (c.sr.s) s.ssp else s.usp };
     c.usp = if (c.sr.s) s.usp else s.ssp;
     c.pc = s.pc -% pc_prefetch_offset;
-    for (s.ram) |w| bus.write16(@truncate(w.addr & 0xFF_FFFE), w.value);
+    for (s.ram) |w| bus.write16(@truncate(w.addr & even_bus_addr_mask), w.value);
 }
+
+/// N/Z/V/C bits, mid-microcode when a fault frame is being compared (see
+/// `compare`'s `frame` doc comment) -- ignored on both the live SR and the
+/// stacked SR in the exception frame.
+const sr_ignore_nzvc_mask: u16 = 0xFFF0;
+
+// Offsets within a group 0 exception frame.
+/// The special status word keeps the R/W bit and the function code in its
+/// low five bits; the rest is prefetch residue.
+const ssw_offset = 0;
+/// The instruction register: depends on source addressing mode bus timing,
+/// not modeled. See DESIGN.md §5.4.
+const frame_ir_offset = 6;
+/// The saved SR carries N/Z/V/C from mid-microcode, like the live SR (see
+/// the sr compare in `compare`).
+const frame_sr_offset = 8;
 
 const Mismatch = struct {
     what: []const u8,
@@ -305,27 +323,21 @@ fn compare(s: *const State, c: *const Cpu, bus: *TrackedBus, frame: ?u32) ?Misma
     // In a faulting case, N/Z/V/C depend on how far the microcode got before
     // the fault, which is prefetch-order state this core does not model —
     // part of the same known gap as the frame fields (DESIGN.md §5.4).
-    const sr_mask: u16 = if (frame != null) 0xFFF0 else 0xFFFF;
+    const sr_mask: u16 = if (frame != null) sr_ignore_nzvc_mask else 0xFFFF;
     if ((c.sr.toInt() ^ sr) & sr_mask != 0) return .{ .what = "sr", .expected = sr, .actual = c.sr.toInt() };
 
     const pc = s.pc -% pc_prefetch_offset;
     if (c.pc != pc) return .{ .what = "pc", .expected = pc, .actual = c.pc };
 
     for (s.ram) |w| {
-        const addr: u24 = @truncate(w.addr & 0xFF_FFFE);
+        const addr: u24 = @truncate(w.addr & even_bus_addr_mask);
         const got = bus.read16(addr);
         if (frame) |f| {
             const off = addr -% @as(u24, @truncate(f));
             switch (off) {
-                // The instruction register: depends on source addressing
-                // mode bus timing, not modeled. See DESIGN.md §5.4.
-                6 => continue,
-                // The special status word keeps the R/W bit and the function
-                // code in its low five bits; the rest is prefetch residue.
-                0 => if ((got ^ w.value) & 0x1F == 0) continue,
-                // The saved SR carries N/Z/V/C from mid-microcode, like the
-                // live SR (see the sr compare above).
-                8 => if ((got ^ w.value) & 0xFFF0 == 0) continue,
+                frame_ir_offset => continue,
+                ssw_offset => if ((got ^ w.value) & m68k.cpu.ssw_field_mask == 0) continue,
+                frame_sr_offset => if ((got ^ w.value) & sr_ignore_nzvc_mask == 0) continue,
                 else => {},
             }
         }
