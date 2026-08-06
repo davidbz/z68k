@@ -497,9 +497,11 @@ turns `zig build sst` red.
 
 ### 5.3 CI
 
-- `zig build test` and the full SST suite on every pull request
-  (`.github/workflows/ci.yml`). The ~2 GB fetch is done per run; the Zig build
-  cache is keyed on the `build.zig.zon` hash.
+- `zig build test` and the full SST suite on every pull request and every push
+  to `main` (`.github/workflows/ci.yml`). Unit tests run in Debug, ReleaseSafe
+  and ReleaseFast — release codegen has its own overflow and safety semantics,
+  and Debug alone never exercises them. The ~2 GB SST fetch is done per run;
+  the Zig build cache is keyed on the `build.zig.zon` hash and the mode.
 
 ### 5.4 Group 0 fault frames
 
