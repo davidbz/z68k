@@ -18,8 +18,7 @@ const std = @import("std");
 const m68k = @import("m68k");
 
 const Cpu = m68k.Cpu;
-const FlatBus = m68k.FlatBus;
-const Core = m68k.Core(FlatBus);
+const Core = m68k.Core(TrackedBus);
 
 const test_dir = "testdata/v1";
 
@@ -221,8 +220,54 @@ const Decoder = struct {
 
 // -------------------------------------------------------------------- comparing
 
+/// Same flat 16 MiB layout as `m68k.FlatBus`, but also remembers which
+/// addresses were written so the driver can undo just those between test
+/// cases instead of re-zeroing the whole buffer (each case only ever
+/// touches a couple hundred bytes of it).
+const TrackedBus = struct {
+    ram: []u8,
+    dirty: [4096]u24 = undefined,
+    dirty_len: usize = 0,
+
+    fn mark(b: *TrackedBus, addr: u24) void {
+        if (b.dirty_len < b.dirty.len) {
+            b.dirty[b.dirty_len] = addr;
+            b.dirty_len += 1;
+        }
+    }
+
+    pub fn read8(b: *TrackedBus, addr: u24) u8 {
+        return b.ram[addr];
+    }
+    pub fn read16(b: *TrackedBus, addr: u24) u16 {
+        return std.mem.readInt(u16, b.ram[addr..][0..2], .big);
+    }
+    pub fn write8(b: *TrackedBus, addr: u24, v: u8) void {
+        b.ram[addr] = v;
+        b.mark(addr);
+    }
+    pub fn write16(b: *TrackedBus, addr: u24, v: u16) void {
+        std.mem.writeInt(u16, b.ram[addr..][0..2], v, .big);
+        b.mark(addr);
+        b.mark(addr +% 1);
+    }
+
+    /// Undoes every write since the last reset. If a single test case
+    /// somehow dirtied more than `dirty` can track (far beyond the widest
+    /// real instruction), falls back to a full clear rather than leaving
+    /// stale bytes behind.
+    fn reset(b: *TrackedBus) void {
+        if (b.dirty_len == b.dirty.len) {
+            @memset(b.ram, 0);
+        } else {
+            for (b.dirty[0..b.dirty_len]) |a| b.ram[a] = 0;
+        }
+        b.dirty_len = 0;
+    }
+};
+
 /// State image -> Cpu. `a7` is whichever stack the S bit selects.
-fn load(s: *const State, c: *Cpu, bus: *FlatBus) void {
+fn load(s: *const State, c: *Cpu, bus: *TrackedBus) void {
     c.* = .{};
     c.sr = m68k.StatusRegister.fromInt(@truncate(s.sr));
     c.d = s.d;
@@ -246,7 +291,7 @@ const Mismatch = struct {
 /// gap (DESIGN.md §5.4) instead of hiding it. Everything else in the frame --
 /// the special status word, the faulting address and the saved SR -- is still
 /// checked.
-fn compare(s: *const State, c: *const Cpu, bus: *FlatBus, frame: ?u32) ?Mismatch {
+fn compare(s: *const State, c: *const Cpu, bus: *TrackedBus, frame: ?u32) ?Mismatch {
     for (s.d, 0..) |want, i| {
         if (c.d[i] != want) return .{ .what = "d", .index = @intCast(i), .expected = want, .actual = c.d[i] };
     }
@@ -317,9 +362,13 @@ fn runFile(src: []const u8, ram: []u8, name: []const u8) !Tally {
     var reported = false;
     var cycles_reported = false;
 
+    // One full clear per file; `bus.reset()` below undoes just what each
+    // case actually touched, rather than re-zeroing all 16 MiB every time.
+    @memset(ram, 0);
+    var bus = TrackedBus{ .ram = ram };
+
     while (try dec.next()) |tc| {
-        @memset(ram, 0);
-        var bus = FlatBus{ .ram = ram };
+        bus.reset();
         var c: Cpu = undefined;
         load(&tc.initial, &c, &bus);
 
@@ -461,7 +510,7 @@ pub fn main(init: std.process.Init) !void {
 
 test "supervisor state image puts ssp in a7" {
     var ram = [_]u8{0} ** 0x100;
-    var bus = FlatBus{ .ram = &ram };
+    var bus = TrackedBus{ .ram = &ram };
     const words = [_]RamWord{.{ .addr = 0x10, .value = 0xABCD }};
 
     var s = State{
@@ -492,7 +541,7 @@ test "supervisor state image puts ssp in a7" {
 
 test "user-mode state image puts usp in a7" {
     var ram = [_]u8{0} ** 0x100;
-    var bus = FlatBus{ .ram = &ram };
+    var bus = TrackedBus{ .ram = &ram };
 
     const s = State{ .usp = 0x1000, .ssp = 0x8000, .sr = 0x0000, .pc = 0x404 };
 
