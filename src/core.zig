@@ -406,12 +406,21 @@ pub fn Core(comptime BusT: type) type {
 
         // ----------------------------------------------------------- exceptions
 
-        /// Cycle cost of taking an exception (M68000UM exception timing).
+        // Cycle costs below are pinned by M68000UM exception timing.
+        const group0_exception_cycles: u8 = 50;
+        const zero_divide_cycles: u8 = 38;
+        const chk_exception_cycles: u8 = 40;
+        const base_exception_cycles: u8 = 34;
+        const interrupt_ack_cycles: u32 = 10;
+        const reset_cycles: u32 = 40;
+        const idle_step_cycles: u32 = 4;
+
+        /// Cycle cost of taking an exception.
         fn exceptionCycles(e: Exception) u8 {
-            if (e.isGroup0()) return 50;
-            if (e == .zero_divide) return 38;
-            if (e == .chk) return 40;
-            return 34;
+            if (e.isGroup0()) return group0_exception_cycles;
+            if (e == .zero_divide) return zero_divide_cycles;
+            if (e == .chk) return chk_exception_cycles;
+            return base_exception_cycles;
         }
 
         pub fn enterException(c: *Cpu, bus: *BusT, e: Exception, g0: ?Group0Info) void {
@@ -437,29 +446,29 @@ pub fn Core(comptime BusT: type) type {
         }
 
         fn frame(ctx: *Ctx, old_sr: cpu_mod.StatusRegister, e: Exception, g0: ?Group0Info) Fault!void {
-            if (e.isGroup0()) {
-                const info = g0 orelse Group0Info{
-                    .access_addr = 0,
-                    .ir = 0,
-                    .read = true,
-                    .program = true,
-                };
+            if (!e.isGroup0()) {
                 try push32(ctx, ctx.cpu.pc);
                 try push16(ctx, old_sr.toInt());
-                try push16(ctx, info.ir);
-                try push32(ctx, info.access_addr);
-                // Special status word: R/W, I/N and the three FC pins. Bits
-                // 5..15 are undefined on hardware; MAME leaves the instruction
-                // register there and the tests check it, so we match.
-                const fc: u16 = (info.ir & 0xFFE0) |
-                    (if (info.read) @as(u16, 0x10) else 0) |
-                    (if (info.program) @as(u16, 2) else 1) |
-                    (if (old_sr.s) @as(u16, 4) else 0);
-                try push16(ctx, fc);
-            } else {
-                try push32(ctx, ctx.cpu.pc);
-                try push16(ctx, old_sr.toInt());
+                return;
             }
+
+            const info = g0 orelse Group0Info{
+                .access_addr = 0,
+                .ir = 0,
+                .read = true,
+                .program = true,
+            };
+            try push32(ctx, ctx.cpu.pc);
+            try push16(ctx, old_sr.toInt());
+            try push16(ctx, info.ir);
+            try push32(ctx, info.access_addr);
+            // Special status word: R/W, I/N and the three FC pins, see
+            // Group0Info's ssw_* constants for the bit layout.
+            const ssw: u16 = (info.ir & cpu_mod.ssw_ir_residue_mask) |
+                (if (info.read) cpu_mod.ssw_rw_read else 0) |
+                (if (info.program) cpu_mod.ssw_fc_program else cpu_mod.ssw_fc_data) |
+                (if (old_sr.s) cpu_mod.ssw_fc_supervisor else 0);
+            try push16(ctx, ssw);
         }
 
         // ------------------------------------------------------------ interrupts
@@ -480,7 +489,7 @@ pub fn Core(comptime BusT: type) type {
             // vectored ack would slot in right here.
             enterException(c, bus, Exception.autovector(level), null);
             c.sr.ipl = level;
-            c.cycles += 10; // interrupt ack overhead on top of the frame
+            c.cycles += interrupt_ack_cycles; // ack overhead on top of the frame
         }
 
         // ------------------------------------------------------------------ step
@@ -493,13 +502,13 @@ pub fn Core(comptime BusT: type) type {
             c.pending_ipl = 0;
             c.a[7] = read32(&ctx, 0, true) catch 0;
             c.pc = read32(&ctx, 4, true) catch 0;
-            c.cycles += 40;
+            c.cycles += reset_cycles;
         }
 
         /// Execute one instruction (or take one pending exception).
         pub fn step(c: *Cpu, bus: *BusT) void {
             if (c.halted) {
-                c.cycles += 4;
+                c.cycles += idle_step_cycles;
                 return;
             }
             // Trace outranks interrupts, and the traced instruction has already
@@ -514,7 +523,7 @@ pub fn Core(comptime BusT: type) type {
                 return;
             }
             if (c.stopped) {
-                c.cycles += 4;
+                c.cycles += idle_step_cycles;
                 return;
             }
 
@@ -853,21 +862,22 @@ pub fn Core(comptime BusT: type) type {
             const count: u16 = @truncate(c.d[reg]);
             const new_count = count -% 1;
 
-            if (new_count != 0xFFFF) {
-                c.cycles -= 2; // branch taken: 10 total, base covers the untaken 12
-                // The branch target is validated before Dn commits: a
-                // faulting branch (odd target) leaves Dn at its old value.
-                // Unlike Bcc's 8-bit form, DBcc always fetches its
-                // displacement word, and the fault frame reflects that
-                // fetch having completed -- the natural post-fetch PC,
-                // not the pre-fetch `base`.
-                ctx.prefetch = .{ .ir = null, .pc = ctx.cpu.pc };
-                try jump(ctx, base +% @as(u32, @bitCast(@as(i32, disp))));
-                setReg(&c.d[reg], .word, new_count);
-            } else {
+            if (count == 0) {
                 c.cycles += 2; // counter expired, no branch: 14 total
                 setReg(&c.d[reg], .word, new_count);
+                return;
             }
+
+            c.cycles -= 2; // branch taken: 10 total, base covers the untaken 12
+            // The branch target is validated before Dn commits: a
+            // faulting branch (odd target) leaves Dn at its old value.
+            // Unlike Bcc's 8-bit form, DBcc always fetches its
+            // displacement word, and the fault frame reflects that
+            // fetch having completed -- the natural post-fetch PC,
+            // not the pre-fetch `base`.
+            ctx.prefetch = .{ .ir = null, .pc = ctx.cpu.pc };
+            try jump(ctx, base +% @as(u32, @bitCast(@as(i32, disp))));
+            setReg(&c.d[reg], .word, new_count);
         }
 
         /// Shared by `opAlu2`'s ea-is-destination direction and
@@ -1056,13 +1066,13 @@ pub fn Core(comptime BusT: type) type {
                 const s: i32 = @as(i16, @bitCast(src));
                 const d: i32 = @as(i16, @bitCast(@as(u16, @truncate(ctx.cpu.d[dn]))));
                 break :blk @bitCast(s *% d);
-            } else @as(u32, src) *% (ctx.cpu.d[dn] & 0xFFFF);
+            } else @as(u32, src) *% (ctx.cpu.d[dn] & Size.word.mask());
 
             const transition_bits: u16 = if (instr.mnemonic == .muls) src ^ (src << 1) else src;
             ctx.cpu.cycles += @as(u64, @popCount(transition_bits)) * 2;
 
             ctx.cpu.d[dn] = value;
-            ctx.cpu.sr.setNzvc(.{ .n = value & 0x8000_0000 != 0, .z = value == 0 });
+            ctx.cpu.sr.setNzvc(.{ .n = value & Size.long.msb() != 0, .z = value == 0 });
         }
 
         /// The real divider is a bit-serial non-restoring binary divider: 15
@@ -1112,6 +1122,36 @@ pub fn Core(comptime BusT: type) type {
             return mcycles * 2;
         }
 
+        fn opDivu(ctx: *Ctx, dn: u3, src: u16) void {
+            const dividend = ctx.cpu.d[dn];
+            const divisor: u32 = src;
+            const quotient = dividend / divisor;
+            ctx.cpu.cycles += divuCycles(dividend, divisor);
+            if (quotient > 0xFFFF) {
+                ctx.cpu.sr.setNzvc(.{ .v = true, .n = true });
+                return;
+            }
+            const remainder = dividend % divisor;
+            ctx.cpu.d[dn] = (remainder << 16) | quotient;
+            ctx.cpu.sr.setNzvc(.{ .n = quotient & Size.word.msb() != 0, .z = quotient == 0 });
+        }
+
+        fn opDivs(ctx: *Ctx, dn: u3, src: u16) void {
+            const dividend: i32 = @bitCast(ctx.cpu.d[dn]);
+            const divisor: i32 = @as(i16, @bitCast(src));
+            ctx.cpu.cycles += divsCycles(dividend, divisor);
+            const quotient = @divTrunc(dividend, divisor);
+            if (quotient > 32767 or quotient < -32768) {
+                ctx.cpu.sr.setNzvc(.{ .v = true, .n = true });
+                return;
+            }
+            const remainder = @rem(dividend, divisor);
+            const q16: u16 = @bitCast(@as(i16, @truncate(quotient)));
+            const r16: u16 = @bitCast(@as(i16, @truncate(remainder)));
+            ctx.cpu.d[dn] = (@as(u32, r16) << 16) | q16;
+            ctx.cpu.sr.setNzvc(.{ .n = quotient < 0, .z = quotient == 0 });
+        }
+
         /// DIVU/DIVS: 32-bit Dn / 16-bit ea -> 16-bit quotient (low word),
         /// 16-bit remainder (high word), X unaffected. Overflow (quotient
         /// doesn't fit 16 bits) sets V, clears C, and leaves Dn untouched —
@@ -1134,33 +1174,7 @@ pub fn Core(comptime BusT: type) type {
             });
             if (src == 0) return Fault.ZeroDivide;
 
-            if (instr.mnemonic == .divu) {
-                const dividend = ctx.cpu.d[dn];
-                const divisor: u32 = src;
-                const quotient = dividend / divisor;
-                ctx.cpu.cycles += divuCycles(dividend, divisor);
-                if (quotient > 0xFFFF) {
-                    ctx.cpu.sr.setNzvc(.{ .v = true, .n = true });
-                    return;
-                }
-                const remainder = dividend % divisor;
-                ctx.cpu.d[dn] = (remainder << 16) | quotient;
-                ctx.cpu.sr.setNzvc(.{ .n = quotient & 0x8000 != 0, .z = quotient == 0 });
-            } else {
-                const dividend: i32 = @bitCast(ctx.cpu.d[dn]);
-                const divisor: i32 = @as(i16, @bitCast(src));
-                ctx.cpu.cycles += divsCycles(dividend, divisor);
-                const quotient = @divTrunc(dividend, divisor);
-                if (quotient > 32767 or quotient < -32768) {
-                    ctx.cpu.sr.setNzvc(.{ .v = true, .n = true });
-                    return;
-                }
-                const remainder = @rem(dividend, divisor);
-                const q16: u16 = @bitCast(@as(i16, @truncate(quotient)));
-                const r16: u16 = @bitCast(@as(i16, @truncate(remainder)));
-                ctx.cpu.d[dn] = (@as(u32, r16) << 16) | q16;
-                ctx.cpu.sr.setNzvc(.{ .n = quotient < 0, .z = quotient == 0 });
-            }
+            if (instr.mnemonic == .divu) opDivu(ctx, dn, src) else opDivs(ctx, dn, src);
         }
 
         /// ORI/ANDI/SUBI/ADDI/EORI/CMPI: immediate always the source, `ea` the
@@ -1522,7 +1536,7 @@ pub fn Core(comptime BusT: type) type {
             const reg: u3 = @truncate(op);
 
             const bit_num: u32 = if (op & 0x0100 == 0)
-                try fetch16(ctx) & 0xFF
+                @as(u32, try fetch16(ctx)) & Size.byte.mask()
             else
                 ctx.cpu.d[@as(u3, @truncate(op >> 9))];
 
@@ -1929,7 +1943,8 @@ pub fn Core(comptime BusT: type) type {
             const operand = try RmwOperand.read(ctx, mode, reg, .byte);
             const old: u8 = @truncate(operand.old);
             ctx.cpu.sr.setNzvc(flags.logic(old, .byte));
-            const new_v = old | 0x80;
+            // sets bit 7 unconditionally
+            const new_v = old | @as(u8, @intCast(Size.byte.msb()));
             try operand.writeBack(ctx, .byte, new_v);
         }
 
@@ -2335,7 +2350,7 @@ test "PC relative operands report program space in the group 0 frame" {
 
     // Special status word: read from program space, user mode.
     const ssw = bus.read16(@truncate(c.a[7]));
-    try std.testing.expectEqual(@as(u16, 0x12), ssw & 0x1F);
+    try std.testing.expectEqual(cpu_mod.ssw_rw_read | cpu_mod.ssw_fc_program, ssw & cpu_mod.ssw_field_mask);
 }
 
 test "unimplemented opcodes take the illegal instruction vector" {
