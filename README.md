@@ -59,6 +59,38 @@ The suite gates on three tiers per file — `state` (full architectural match),
 — and fails if any falls short of every case. Nothing is masked or excused, so
 any regression turns it red.
 
+## Booting a real ROM
+
+The suite proves each instruction in isolation. `examples/amiga.zig` proves the
+core can carry a few hundred million of them in a row, by running real Amiga
+ROM code against just enough of an A500 memory map: chip RAM, the CIA-A OVL
+bit, a beam position derived from the cycle count, and the serial transmitter
+wired to stdout. No Agnus, Denise or Paula.
+
+[DiagROM](https://www.diagrom.com) is the target, since it narrates itself over
+the serial port — its output *is* the test result. It is freely distributable
+and fetched once into `roms/` (gitignored):
+
+```sh
+tools/fetch_diagrom.sh
+zig build amiga                  # 30 emulated seconds of roms/diagrom.rom
+zig build amiga -- other.rom 5   # any other 512K ROM, 5 emulated seconds
+```
+
+It completes its whole power-on sequence: ROM address and checksum tests (all
+green), the OVL check, the chip RAM scan and address test, Agnus detection off
+the raster, `CPU: 68000` from its own instruction probes, and on to the
+interactive menu — about 200 million cycles with nothing wedged. The one red
+`E`, at the end of the ROM address test, is the ROM image's own doing: most of
+it is filled with longwords holding their own address, and the last four
+(`$FFFFF0`-`$FFFFFF`) are zero in the shipped file, so the check that reads
+them back fails. Nothing to do with the core — every byte read there is the
+byte in the file.
+
+A Kickstart ROM boots here too, but there is nothing to watch: it puts its
+output on the screen, and there are no bitplanes and no vertical-blank
+interrupt for exec to run on.
+
 ## Using the library
 
 The core is a dependency-free Zig module named `m68k`. It never allocates; the
@@ -91,6 +123,7 @@ src/decode.zig     EaMode, comptime 64K-entry decode table  (data + pure fns)
 src/flags.zig      condition-code computation               (pure fns)
 src/core.zig       Core(BusT): step/run/reset/EA/exceptions (logic)
 src/harness.zig    SingleStepTests conformance runner
+examples/amiga.zig   minimal A500 memory map, for booting real ROMs
 src/system_test.zig  interrupts, STOP, trace, reset, halted   (sequences)
 src/fuzz_test.zig    step() vs. a contract-checking bus       (invariants)
 ```
