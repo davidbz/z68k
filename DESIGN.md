@@ -652,7 +652,29 @@ The word-order split is the one to remember: order is state-visible on reads
 (a fault mid-long leaves the already-read half committed) and invisible on
 writes (both halves are aligned by then, or the operand read faulted first).
 
-### 5.7 Opcode census
+### 5.7 Fuzzing and the soak test
+
+`src/fuzz_test.zig` runs `step()` from a randomised `Cpu` over a randomised
+128-byte program, against a bus that asserts the §3.7 contract (word accesses
+word-aligned, every address inside the decoded space). All 256 vectors point
+back into the fuzzed code, so exceptions keep the run going instead of parking
+it on a page of zeroes. The invariants are the ones no expected-value table can
+express: no panic, time always moves, `halted` is sticky, the SR round-trips
+through `toInt`/`fromInt`, and `reset` recovers from any state.
+
+`zig build fuzz --fuzz` is the coverage-guided form; it does not build under
+Zig 0.16.0 (a type error in the shipped `test_runner.zig`, not ours). The same
+body therefore also runs as a fixed-seed PRNG soak in `zig build test` — ~2,000
+runs of 200 steps, about a second — so it is exercised in CI regardless.
+
+It found one thing worth writing down: **the step that takes a double bus fault
+costs zero cycles.** `enterException` abandons the half-written frame and
+returns without charging anything. It cannot hang a host — `halted` is sticky
+and a halted step charges the idle 4 — and how long the real chip spends before
+asserting HALT is not something the recordings can say, so the invariant admits
+exactly that one case rather than inventing a number.
+
+### 5.8 Opcode census
 
 `zig build sst -- --coverage` sets a bit per executed encoding and prints, by
 mnemonic, which families the suite left holes in. 2500 sampled cases per file
