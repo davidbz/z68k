@@ -21,6 +21,7 @@ const Cpu = m68k.Cpu;
 const Core = m68k.Core(TrackedBus);
 
 const test_dir = "testdata/v1";
+const ram_bytes = 0x100_0000;
 
 /// The recorded PC is MAME's `m_au`, the *next prefetch* address, which sits 4
 /// bytes ahead of where execution actually begins. Everything else in the state
@@ -39,15 +40,14 @@ const magic_test = 0xABC12367;
 const magic_name = 0x89ABCDEF;
 const magic_state = 0x01234567;
 const magic_transactions = 0x456789AB;
-const transaction_payload_bytes = 20; // fc, addr, data, UDS, LDS
 
 const DecodeError = error{ Truncated, BadMagic, TooManyRamWords };
 
 const RamWord = struct { addr: u32, value: u16 };
 
 pub const State = struct {
-    // Field order is the file's register order; `read` depends on it.
     d: [8]u32 = @splat(0),
+    /// a0..a6 only; a7 is `usp` or `ssp` depending on the S bit in `sr`.
     a: [7]u32 = @splat(0),
     usp: u32 = 0,
     ssp: u32 = 0,
@@ -70,22 +70,11 @@ const Reader = struct {
     buf: []const u8,
     pos: usize = 0,
 
-    fn u32_(r: *Reader) DecodeError!u32 {
-        if (r.pos + 4 > r.buf.len) return error.Truncated;
-        defer r.pos += 4;
-        return std.mem.readInt(u32, r.buf[r.pos..][0..4], .little);
-    }
-
-    fn u16_(r: *Reader) DecodeError!u16 {
-        if (r.pos + 2 > r.buf.len) return error.Truncated;
-        defer r.pos += 2;
-        return std.mem.readInt(u16, r.buf[r.pos..][0..2], .little);
-    }
-
-    fn u8_(r: *Reader) DecodeError!u8 {
-        if (r.pos + 1 > r.buf.len) return error.Truncated;
-        defer r.pos += 1;
-        return r.buf[r.pos];
+    fn int(r: *Reader, comptime T: type) DecodeError!T {
+        const n = @divExact(@typeInfo(T).int.bits, 8);
+        if (r.pos + n > r.buf.len) return error.Truncated;
+        defer r.pos += n;
+        return std.mem.readInt(T, r.buf[r.pos..][0..n], .little);
     }
 
     fn bytes(r: *Reader, n: usize) DecodeError![]const u8 {
@@ -94,10 +83,22 @@ const Reader = struct {
         return r.buf[r.pos..][0..n];
     }
 
-    /// Every block is prefixed with its byte count and a magic number.
-    fn block(r: *Reader, magic: u32) DecodeError!void {
-        _ = try r.u32_(); // byte count, unused: blocks are walked, not skipped
-        if (try r.u32_() != magic) return error.BadMagic;
+    /// Opens a block: `{ u32 size, u32 magic, payload... }`, where `size`
+    /// spans the whole block, header included. Returns the offset one past the
+    /// block, to be handed back to `close`.
+    fn open(r: *Reader, magic: u32) DecodeError!usize {
+        const start = r.pos;
+        const size = try r.int(u32);
+        if (try r.int(u32) != magic) return error.BadMagic;
+        return start + size;
+    }
+
+    /// Seeks to the end of a block opened by `open`. Payload we do not care
+    /// about therefore costs nothing to walk past, and a payload we do read is
+    /// resynchronised here even if the format grows a trailing field.
+    fn close(r: *Reader, block_end: usize) DecodeError!void {
+        if (block_end < r.pos or block_end > r.buf.len) return error.Truncated;
+        r.pos = block_end;
     }
 };
 
@@ -111,10 +112,10 @@ const Decoder = struct {
     fn init(buf: []const u8) DecodeError!Decoder {
         var r = Reader{ .buf = buf };
         // The file header is magic-first, unlike every other block.
-        if (try r.u32_() != magic_file) return error.BadMagic;
+        if (try r.int(u32) != magic_file) return error.BadMagic;
         // Read the count before building the result: a struct literal copies
         // `r` as it is when the field is evaluated, not after.
-        const count = try r.u32_();
+        const count = try r.int(u32);
         return .{ .r = r, .remaining = count };
     }
 
@@ -122,61 +123,66 @@ const Decoder = struct {
         if (d.remaining == 0) return null;
         d.remaining -= 1;
 
-        try d.r.block(magic_test);
-
-        try d.r.block(magic_name);
-        const name_len = try d.r.u32_();
-        const name = try d.r.bytes(name_len);
-
+        const test_end = try d.r.open(magic_test);
+        const name = try d.readName();
         const initial = try d.readState(&d.ram_initial);
         const final = try d.readState(&d.ram_final);
-        const length = try d.readTransactions();
+        const length = try d.readCycles();
+        try d.r.close(test_end);
 
         return .{ .name = name, .initial = initial, .final = final, .length = length };
     }
 
+    fn readName(d: *Decoder) DecodeError![]const u8 {
+        const end = try d.r.open(magic_name);
+        const len = try d.r.int(u32);
+        const name = try d.r.bytes(len);
+        try d.r.close(end);
+        return name;
+    }
+
     fn readState(d: *Decoder, ram_buf: []RamWord) DecodeError!State {
-        try d.r.block(magic_state);
+        const end = try d.r.open(magic_state);
 
         var s = State{};
-        for (&s.d) |*v| v.* = try d.r.u32_();
-        for (&s.a) |*v| v.* = try d.r.u32_();
-        s.usp = try d.r.u32_();
-        s.ssp = try d.r.u32_();
-        s.sr = try d.r.u32_();
-        s.pc = try d.r.u32_();
-        s.prefetch = .{ try d.r.u32_(), try d.r.u32_() };
+        for (&s.d) |*v| v.* = try d.r.int(u32);
+        for (&s.a) |*v| v.* = try d.r.int(u32);
+        s.usp = try d.r.int(u32);
+        s.ssp = try d.r.int(u32);
+        s.sr = try d.r.int(u32);
+        s.pc = try d.r.int(u32);
+        s.prefetch = .{ try d.r.int(u32), try d.r.int(u32) };
 
         // RAM is recorded in 16-bit units, matching the real data bus.
-        const count = try d.r.u32_();
+        const count = try d.r.int(u32);
         if (count > ram_buf.len) return error.TooManyRamWords;
         for (ram_buf[0..count]) |*w| {
-            w.addr = try d.r.u32_();
-            w.value = try d.r.u16_();
+            w.addr = try d.r.int(u32);
+            w.value = try d.r.int(u16);
         }
         s.ram = ram_buf[0..count];
+
+        try d.r.close(end);
         return s;
     }
 
-    /// Only the cycle count is kept; per-cycle bus activity is outside this
-    /// emulator's accuracy target (DESIGN.md §1). The entries still have to be
-    /// walked to find the next test.
-    fn readTransactions(d: *Decoder) DecodeError!u32 {
-        try d.r.block(magic_transactions);
-        const cycles = try d.r.u32_();
-        const count = try d.r.u32_();
-
-        for (0..count) |_| {
-            const kind = try d.r.u8_();
-            _ = try d.r.u32_(); // cycles for this transaction
-            if (kind == 0) continue; // idle
-            _ = try d.r.bytes(transaction_payload_bytes);
-        }
+    /// Only the block's total is kept; per-cycle bus activity is outside this
+    /// emulator's accuracy target (DESIGN.md §1), so the transaction list is
+    /// skipped rather than decoded.
+    fn readCycles(d: *Decoder) DecodeError!u32 {
+        const end = try d.r.open(magic_transactions);
+        const cycles = try d.r.int(u32);
+        try d.r.close(end);
         return cycles;
     }
 };
 
 // -------------------------------------------------------------------- comparing
+
+/// Test RAM is addressed in 16-bit units on a 24-bit bus.
+fn busAddr(addr: u32) u24 {
+    return @truncate(addr & even_bus_addr_mask);
+}
 
 /// Same flat 16 MiB layout as `m68k.FlatBus`, but also remembers which
 /// addresses were written so the driver can undo just those between test
@@ -229,43 +235,64 @@ fn load(s: *const State, c: *Cpu, bus: *TrackedBus) void {
     c.* = .{};
     c.sr = m68k.StatusRegister.fromInt(@truncate(s.sr));
     c.d = s.d;
-    c.a = .{ s.a[0], s.a[1], s.a[2], s.a[3], s.a[4], s.a[5], s.a[6], if (c.sr.s) s.ssp else s.usp };
+    c.a[0..7].* = s.a;
+    c.a[7] = if (c.sr.s) s.ssp else s.usp;
     c.usp = if (c.sr.s) s.usp else s.ssp;
     c.pc = s.pc -% pc_prefetch_offset;
-    for (s.ram) |w| bus.write16(@truncate(w.addr & even_bus_addr_mask), w.value);
+    for (s.ram) |w| bus.write16(busAddr(w.addr), w.value);
 }
 
 const Mismatch = struct {
-    what: []const u8,
-    index: u8 = 0,
-    /// For `ram` mismatches, the address that differed.
-    addr: u32 = 0,
+    at: At,
     expected: u32,
     actual: u32,
+
+    /// Where the difference is. `d` and `a` carry a register number and `ram`
+    /// an address; the rest are one of a kind.
+    const At = union(enum) {
+        d: u8,
+        a: u8,
+        ram: u24,
+        ssp,
+        usp,
+        sr,
+        pc,
+    };
+
+    pub fn format(m: Mismatch, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (m.at) {
+            .d => |i| try w.print("d{d}", .{i}),
+            .a => |i| try w.print("a{d}", .{i}),
+            .ram => |addr| try w.print("ram@{x:0>6}", .{addr}),
+            inline else => |_, tag| try w.writeAll(@tagName(tag)),
+        }
+        try w.print(" expected {x:0>8}, got {x:0>8}", .{ m.expected, m.actual });
+    }
 };
 
 /// Everything is compared exactly, including every word of a group 0
 /// exception frame: nothing here is masked or excused.
 fn compare(s: *const State, c: *const Cpu, bus: *TrackedBus) ?Mismatch {
-    for (s.d, 0..) |want, i| {
-        if (c.d[i] != want) return .{ .what = "d", .index = @intCast(i), .expected = want, .actual = c.d[i] };
+    for (s.d, c.d, 0..) |want, got, i| {
+        if (got != want) return .{ .at = .{ .d = @intCast(i) }, .expected = want, .actual = got };
     }
-    for (s.a, 0..) |want, i| {
-        if (c.a[i] != want) return .{ .what = "a", .index = @intCast(i), .expected = want, .actual = c.a[i] };
+    // a7 is covered by the ssp/usp checks below.
+    for (s.a, c.a[0..7], 0..) |want, got, i| {
+        if (got != want) return .{ .at = .{ .a = @intCast(i) }, .expected = want, .actual = got };
     }
-    if (c.ssp() != s.ssp) return .{ .what = "ssp", .expected = s.ssp, .actual = c.ssp() };
-    if (c.userSp() != s.usp) return .{ .what = "usp", .expected = s.usp, .actual = c.userSp() };
+    if (c.ssp() != s.ssp) return .{ .at = .ssp, .expected = s.ssp, .actual = c.ssp() };
+    if (c.userSp() != s.usp) return .{ .at = .usp, .expected = s.usp, .actual = c.userSp() };
 
     const sr = m68k.StatusRegister.fromInt(@truncate(s.sr)).toInt();
-    if (c.sr.toInt() != sr) return .{ .what = "sr", .expected = sr, .actual = c.sr.toInt() };
+    if (c.sr.toInt() != sr) return .{ .at = .sr, .expected = sr, .actual = c.sr.toInt() };
 
     const pc = s.pc -% pc_prefetch_offset;
-    if (c.pc != pc) return .{ .what = "pc", .expected = pc, .actual = c.pc };
+    if (c.pc != pc) return .{ .at = .pc, .expected = pc, .actual = c.pc };
 
     for (s.ram) |w| {
-        const addr: u24 = @truncate(w.addr & even_bus_addr_mask);
+        const addr = busAddr(w.addr);
         const got = bus.read16(addr);
-        if (got != w.value) return .{ .what = "ram", .addr = addr, .expected = w.value, .actual = got };
+        if (got != w.value) return .{ .at = .{ .ram = addr }, .expected = w.value, .actual = got };
     }
     return null;
 }
@@ -276,13 +303,59 @@ const Tally = struct {
     total: usize = 0,
     state_ok: usize = 0,
     cycles_ok: usize = 0,
+
+    fn add(t: *Tally, other: Tally) void {
+        t.total += other.total;
+        t.state_ok += other.state_ok;
+        t.cycles_ok += other.cycles_ok;
+    }
+
+    fn clean(t: Tally) bool {
+        return t.state_ok == t.total and t.cycles_ok == t.total;
+    }
+};
+
+/// Prints the first state failure and the first cycle miss in a file and then
+/// goes quiet: once a file is broken the other 2499 cases almost always repeat
+/// the same story, and the tally already says how widespread it is.
+const Reporter = struct {
+    file: []const u8,
+    state_shown: bool = false,
+    cycles_shown: bool = false,
+
+    fn stateFailure(rep: *Reporter, tc: TestCase, m: Mismatch) void {
+        if (rep.state_shown) return;
+        rep.state_shown = true;
+        std.debug.print(
+            \\  {s}: first failure in "{s}": {f}
+            \\      sr {x:0>4}->{x:0>4}  pc {x:0>6}->{x:0>6}  ssp {x:0>6}->{x:0>6}
+            \\
+        , .{
+            rep.file,
+            tc.name,
+            m,
+            @as(u16, @truncate(tc.initial.sr)),
+            @as(u16, @truncate(tc.final.sr)),
+            tc.initial.pc,
+            tc.final.pc,
+            tc.initial.ssp,
+            tc.final.ssp,
+        });
+    }
+
+    fn cycleFailure(rep: *Reporter, tc: TestCase, actual: u64) void {
+        if (rep.cycles_shown) return;
+        rep.cycles_shown = true;
+        std.debug.print("  {s}: first cycle miss in \"{s}\": expected {d}, got {d}\n", .{
+            rep.file, tc.name, tc.length, actual,
+        });
+    }
 };
 
 fn runFile(src: []const u8, ram: []u8, name: []const u8) !Tally {
     var dec = try Decoder.init(src);
     var tally = Tally{};
-    var reported = false;
-    var cycles_reported = false;
+    var rep = Reporter{ .file = name };
 
     // One full clear per file; `bus.reset()` below undoes just what each
     // case actually touched, rather than re-zeroing all 16 MiB every time.
@@ -298,37 +371,13 @@ fn runFile(src: []const u8, ram: []u8, name: []const u8) !Tally {
 
         tally.total += 1;
         if (compare(&tc.final, &c, &bus)) |m| {
-            if (!reported) {
-                reported = true;
-                std.debug.print(
-                    "  {s}: first failure in \"{s}\": {s}{d}@{x:0>6} expected {x:0>8}, got {x:0>8}" ++
-                        " (sr {x:0>4}->{x:0>4}, pc {x:0>6}->{x:0>6}, ssp {x:0>6}->{x:0>6})\n",
-                    .{
-                        name,
-                        tc.name,
-                        m.what,
-                        m.index,
-                        m.addr,
-                        m.expected,
-                        m.actual,
-                        @as(u16, @truncate(tc.initial.sr)),
-                        @as(u16, @truncate(tc.final.sr)),
-                        tc.initial.pc,
-                        tc.final.pc,
-                        tc.initial.ssp,
-                        tc.final.ssp,
-                    },
-                );
-            }
+            rep.stateFailure(tc, m);
         } else {
             tally.state_ok += 1;
             if (c.cycles == tc.length) {
                 tally.cycles_ok += 1;
-            } else if (!cycles_reported) {
-                cycles_reported = true;
-                std.debug.print("  {s}: first cycle miss in \"{s}\": expected {d}, got {d}\n", .{
-                    name, tc.name, tc.length, c.cycles,
-                });
+            } else {
+                rep.cycleFailure(tc, c.cycles);
             }
         }
     }
@@ -352,7 +401,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer dir.close(io);
 
-    const ram = try gpa.alloc(u8, 0x100_0000);
+    const ram = try gpa.alloc(u8, ram_bytes);
     defer gpa.free(ram);
 
     var total = Tally{};
@@ -379,9 +428,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("  {s:<24} state {d:>5}/{d:<5} cycles {d:>5}\n", .{
             entry.name, t.state_ok, t.total, t.cycles_ok,
         });
-        total.total += t.total;
-        total.state_ok += t.state_ok;
-        total.cycles_ok += t.cycles_ok;
+        total.add(t);
         files += 1;
     }
 
@@ -401,7 +448,7 @@ pub fn main(init: std.process.Init) !void {
         total.state_ok,  total.total,
         total.cycles_ok, total.total,
     });
-    if (total.state_ok != total.total or total.cycles_ok != total.total) return error.ConformanceFailed;
+    if (!total.clean()) return error.ConformanceFailed;
 }
 
 // ------------------------------------------------------------------------ tests
@@ -432,9 +479,9 @@ test "supervisor state image puts ssp in a7" {
 
     try std.testing.expectEqual(@as(?Mismatch, null), compare(&s, &c, &bus));
 
-    // A real difference is actually caught.
+    // A real difference is actually caught, and it names the right register.
     s.d[3] = 0xFFFF;
-    try std.testing.expect(compare(&s, &c, &bus) != null);
+    try std.testing.expectEqual(Mismatch.At{ .d = 3 }, compare(&s, &c, &bus).?.at);
 }
 
 test "user-mode state image puts usp in a7" {
@@ -451,8 +498,34 @@ test "user-mode state image puts usp in a7" {
     try std.testing.expectEqual(@as(?Mismatch, null), compare(&s, &c, &bus));
 }
 
+test "mismatch names the location" {
+    var buf: [64]u8 = undefined;
+    const m = Mismatch{ .at = .{ .ram = 0x1234 }, .expected = 0xAA, .actual = 0xBB };
+    try std.testing.expectEqualStrings(
+        "ram@001234 expected 000000aa, got 000000bb",
+        try std.fmt.bufPrint(&buf, "{f}", .{m}),
+    );
+    const sr = Mismatch{ .at = .sr, .expected = 0, .actual = 1 };
+    try std.testing.expectEqualStrings(
+        "sr expected 00000000, got 00000001",
+        try std.fmt.bufPrint(&buf, "{f}", .{sr}),
+    );
+}
+
 test "decoder rejects a bad header" {
     const junk = [_]u8{0} ** 16;
     try std.testing.expectError(error.BadMagic, Decoder.init(&junk));
     try std.testing.expectError(error.Truncated, Decoder.init(&.{}));
+}
+
+test "decoder rejects a block that runs past the file" {
+    // File header, then a test block claiming a size the file cannot back.
+    var buf: [16]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], magic_file, .little);
+    std.mem.writeInt(u32, buf[4..8], 1, .little); // one test
+    std.mem.writeInt(u32, buf[8..12], 1 << 20, .little); // absurd block size
+    std.mem.writeInt(u32, buf[12..16], magic_test, .little);
+
+    var dec = try Decoder.init(&buf);
+    try std.testing.expectError(error.Truncated, dec.next());
 }
