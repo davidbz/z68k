@@ -451,7 +451,7 @@ there. Cycle bases come from Musashi's tables / the M68000UM.
 | ADDQ/SUBQ/Scc/DBcc | `0101` | ADDQ/SUBQ to An: no flags, always long |
 | Bcc/BSR/BRA | `0110` | 8-bit disp; 0x00 → 16-bit form |
 | MOVEQ | `0111` | sign-extended 8-bit → long |
-| OR/DIVU/DIVS/SBCD | `1000` | division: 140+ cycles, computed not constant |
+| OR/DIVU/DIVS/SBCD | `1000` | division: cycle-accurate bit-serial simulation, not a table (`divuCycles`/`divsCycles`) |
 | SUB/SUBA/SUBX | `1001` | |
 | CMP/CMPA/CMPM/EOR | `1011` | |
 | AND/MULU/MULS/ABCD/EXG | `1100` | MULU cost = 38 + 2·popcount(src) |
@@ -634,7 +634,8 @@ read-modify-write and memory-destination forms, in both directions — e.g.
 `CLR.l (A3)+` is 58 cycles on hardware, 64 from the model (overcounts);
 `SUB.l D4, -(A6)` is 22 on hardware, 14 from the model (undercounts). Left as
 compositional-but-imperfect for consistency until M5 tightens cycle tables
-per instruction, rather than hand-tuning constants now.
+per instruction, rather than hand-tuning constants now (resolved — see M5
+status below).
 
 **M3 status** (104 opcode files, 260000 cases; 21 upstream files skipped as
 unimplemented — the remaining system-instruction/TRAP/CHK line for M4):
@@ -642,8 +643,8 @@ ASx/LSx/ROx/ROXx (register and memory forms), BTST/BCHG/BCLR/BSET (static and
 dynamic), MOVEP, ABCD/SBCD/NBCD, EXG, and MULU/MULS/DIVU/DIVS all pass state
 tier. `aerr-pc` climbs to 25970 (same documented gap); cycle tier trails
 state tier further here than in M2, since MULU/MULS's operand-dependent cost
-and DIVU/DIVS's `140+` computed cost (§4.8) are only roughly modelled.
-**Unexplained failures: 0.**
+and DIVU/DIVS's `140+` computed cost (§4.8) are only roughly modelled (resolved
+— see M5 status below). **Unexplained failures: 0.**
 
 Two BCD flag rules and one DIVU/DIVS flag rule were pinned down empirically
 against conformance data rather than the manual, which leaves them
@@ -677,6 +678,32 @@ optional 8-bit form; RTS/RTE/RTR all mark their own pre-jump PC rather than
 the popped target; MOVEM marks once per instruction (after its mask word
 and any EA extension words), applied uniformly to whichever register in the
 transfer list actually faults.
+
+**M5 status** (same 125 files, 312500 cases): the cycle tier now passes
+everywhere the state tier does — 312011/312500, exactly matching state, with
+the remaining 489 gap entirely `aerr-pc` (§5.4, unchanged). **Unexplained
+failures: 0.**
+
+Three families accounted for the whole gap from M4, each needing a different
+fix rather than one shared correction:
+
+- **DIVU/DIVS**: the placeholder cost from M3 (§4.8) is gone. Both are now a
+  direct port of Jorge Cwik's cycle-accurate simulation of the divide
+  microcode — a 15-iteration bit-serial restoring-division loop
+  (`divuCycles`/`divsCycles` in `core.zig`) — rather than any closed-form
+  table, since the real hardware's cost is genuinely data-dependent on the
+  dividend/divisor bit pattern, not just their magnitudes.
+- **MOVEfromSR**'s memory form used MOVE's predecrement-discounted
+  `destCycles` table by analogy, but it isn't a MOVE-shaped write: it reads
+  the destination first (same as `MOVEtoCCR`), so it needed the full `cycles`
+  table plus a flat `-4` fault correction, not the discount.
+- **MOVE**'s destination-fault correction is flat `-4` for every non-`abs_long`
+  EA at every size, and for `abs_long` itself at long size — matching the
+  single-operand fault table used everywhere else in the core. `abs_long` at
+  word/byte size is the one real exception: it only needs the `-4` when the
+  source operand cost the bus a cycle of its own (anything but a free `Dn`/`An`
+  read), since `abs_long`'s two extension words then overlap that prior access
+  differently than they would after a free register read.
 
 ## 6. References
 
