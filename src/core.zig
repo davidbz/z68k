@@ -58,8 +58,10 @@ pub fn Core(comptime BusT: type) type {
             /// which case applies.
             chk_delta: u8 = 0,
             /// Set once a handler has passed a point where the group 0 frame's
-            /// PC diverges from the pre-fault fallback. IR keeps the fallback
-            /// value in every case here -- see the comment on `markPrefetch`.
+            /// PC diverges from the pre-fault fallback. A null `ir` keeps the
+            /// fallback, the opcode still executing, which is what every
+            /// family shows except MOVE's word predecrement destination (see
+            /// `opMove`).
             prefetch: ?struct { ir: ?u16, pc: u32 } = null,
         };
 
@@ -73,11 +75,9 @@ pub fn Core(comptime BusT: type) type {
         /// used no bus cycle at all (register direct), an absolute
         /// destination's prefetch gets a second bonus word too, landing past
         /// both its extension words instead of just one -- that spare source
-        /// bus slot is what buys it. IR sometimes follows along and
-        /// sometimes doesn't, in a way that (unlike PC) depends on the source
-        /// addressing mode's own internal bus timing (e.g. predecrement's
-        /// extra address-computation cycle) rather than just word counts --
-        /// not modeled here; see DESIGN.md §5.4.
+        /// bus slot is what buys it. IR is left alone: only a destination
+        /// slow enough for the *next* opcode to arrive changes it, which
+        /// `opMove` handles for the one mode where that happens.
         fn markPrefetch(ctx: *Ctx, pc_before: u32, mode: EaMode, src_free: bool) void {
             // abs_long has two extension words; "fully consumed" is +4. Every
             // other mode's bonus is +2 either way, so only abs_long can tell
@@ -93,9 +93,9 @@ pub fn Core(comptime BusT: type) type {
         /// regardless of how many extension words that addressing needed.
         /// Predecrement is the one exception: its address-computation cycle
         /// has no bus work of its own, giving the prefetch a free slot to
-        /// complete in before the read, same as a destination write. IR
-        /// keeps reflecting the instruction still executing, i.e. the
-        /// pre-fault fallback. See DESIGN.md §5.4.
+        /// complete in before the read, same as a destination write. IR keeps
+        /// reflecting the instruction still executing: no read fault in the
+        /// suite gets far enough to latch the next opcode.
         fn markReadFault(ctx: *Ctx, pc_before: u32, mode: EaMode, size: Size) void {
             // Modes with no ALU work between the last extension-word fetch
             // and the access (predecrement's subtract, or absolute's fetched
@@ -682,33 +682,63 @@ pub fn Core(comptime BusT: type) type {
                 return;
             }
 
-            // Flag latch order matters when the destination write faults:
-            // word moves and the low-word-first predecrement have already
-            // updated CCR, everything else has not. (MAME's microcode order,
-            // checked by the conformance data.)
+            // A faulting destination write freezes CCR wherever the microcode
+            // had got to, which the conformance data pins down per operand
+            // pair. Byte and word moves are always finished by then; a long
+            // move is only finished if its destination needed no further
+            // address work than the pure register modes below. The write path
+            // re-applies the full set on success, so this staging is only
+            // ever visible on the faulting path.
             const cc = flags.logic(v, size);
-            const flags_first = size != .long or dst_mode == .addr_predec;
-            if (flags_first) ctx.cpu.sr.setNzvc(cc);
+            const src_free = src_mode == .data_reg or src_mode == .addr_reg;
+            if (size != .long) {
+                ctx.cpu.sr.setNzvc(cc);
+                // A long immediate arrives as two prefetch words, so like a
+                // register source it never reaches the ALU on the data bus.
+            } else if (src_free or src_mode == .immediate) switch (dst_mode) {
+                .addr_ind, .addr_postinc => {},
+                // The destination's own extension word buys enough time to
+                // latch N and Z from the full long, but V and C are not
+                // cleared yet.
+                .addr_disp, .addr_index => {
+                    ctx.cpu.sr.n = cc.n;
+                    ctx.cpu.sr.z = cc.z;
+                },
+                else => ctx.cpu.sr.setNzvc(cc),
+            } else switch (dst_mode) {
+                // A memory source's low word is the last one its read pushed
+                // through the ALU, and that is still what N and Z show.
+                .addr_ind, .addr_postinc, .abs_long => {
+                    ctx.cpu.sr.setNzvc(flags.logic(v, .word));
+                },
+                else => ctx.cpu.sr.setNzvc(cc),
+            }
 
             ctx.cpu.cycles += dst_mode.destCycles(size);
             {
-                const src_free = src_mode == .data_reg or src_mode == .addr_reg;
                 // Predecrement pays its full cost even when it faults; its
-                // first access is the one the destCycles discount covers.
-                // A long destination gives back a flat 4 regardless of EA
-                // kind, same shape as the source fault above. A word/byte
-                // destination only needs that same -4 for `abs_long`: its
-                // two extension words overlap the bus differently once the
-                // source read (anything but a free register) has already
-                // used it.
-                errdefer if (dst_mode != .addr_predec) {
-                    if (size == .long or (dst_mode == .abs_long and !src_free)) {
-                        ctx.cpu.cycles -= 4;
+                // first access is the one the destCycles discount covers. At
+                // word size it is also the one destination slow enough that
+                // the *next* opcode has already been prefetched by fault
+                // time: the frame shows that word in IR instead of this
+                // instruction, and the fetch itself costs 4 cycles. Every
+                // other MOVE destination (and every other family) shows its
+                // own opcode, and gives back a flat 4 at long size, plus a
+                // further 4 for `abs_long` at any size once the source read
+                // (anything but a free register) has used the bus: its two
+                // extension words then overlap that access differently.
+                errdefer if (dst_mode == .addr_predec) {
+                    if (size == .word) {
+                        if (ctx.prefetch) |*p| p.ir = ctx.bus.read16(@truncate(ctx.cpu.pc));
+                        ctx.cpu.cycles += 4;
                     }
+                } else {
+                    if (size == .long) ctx.cpu.cycles -= 4;
+                    if (dst_mode == .abs_long and !src_free) ctx.cpu.cycles -= 4;
                 };
                 try writeEa(ctx, dst_mode, dst_reg, size, v, src_free);
             }
-            if (!flags_first) ctx.cpu.sr.setNzvc(cc);
+            ctx.cpu.sr.setNzvc(cc);
         }
 
         /// NEGX/CLR/NEG/NOT/TST: one data operand, read (and for all but TST,
@@ -1823,6 +1853,10 @@ pub fn Core(comptime BusT: type) type {
 
         fn opTrapv(ctx: *Ctx) Fault!void {
             if (!ctx.cpu.sr.v) return;
+            // The 4 cycles TRAPV costs when it falls through are already part
+            // of the trap's own 34, the way every other exception-only
+            // instruction carries no base cost at all.
+            ctx.cpu.cycles -= 4;
             ctx.trap_vector = .trapv;
             return Fault.Trap;
         }
@@ -1940,6 +1974,7 @@ pub fn Core(comptime BusT: type) type {
         fn opTas(ctx: *Ctx, op: u16) Fault!void {
             const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
             const reg: u3 = @truncate(op);
+            ctx.cpu.cycles += mode.cycles(.byte);
             const operand = try RmwOperand.read(ctx, mode, reg, .byte);
             const old: u8 = @truncate(operand.old);
             ctx.cpu.sr.setNzvc(flags.logic(old, .byte));

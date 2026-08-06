@@ -7,28 +7,25 @@ knowledge of any particular machine: the host supplies the bus.
 Accuracy is validated against the MAME-generated
 [SingleStepTests/m68000](https://github.com/SingleStepTests/m68000) suite, at
 the level of architectural state (registers, SR, PC, memory) and total
-per-instruction cycle counts. Per-cycle bus activity isn't modelled, and a
-prefetch-queue approximation covers most, but not all, of the fault-frame
-effects that has; see [DESIGN.md](DESIGN.md) for the rationale and the one
-known remaining divergence this causes.
+per-instruction cycle counts. Per-cycle bus activity isn't modelled; a
+prefetch-queue approximation reproduces the fault-frame effects it has,
+including the group 0 exception frame's PC, instruction register and
+mid-microcode CCR. See [DESIGN.md](DESIGN.md) for the rationale.
 
 ## Status
 
-Early development (milestone M5 of 6, cycle tables tightened): the full
-`0100`-line instruction set now has handlers — M1's decode table,
-MOVE/MOVEA/MOVEQ, LEA, branches, RTS and exception machinery; the M2 ALU
-families — NEG/NEGX/NOT/CLR/TST, Scc/DBcc, ADD/SUB/AND/OR/EOR/CMP (and their
-address forms), ADDX/SUBX/CMPM, and the immediate/CCR/SR logic ops; the M3
-families — ASx/LSx/ROx/ROXx, BTST/BCHG/BCLR/BSET, MOVEP, ABCD/SBCD/NBCD,
-EXG, and MULU/MULS/DIVU/DIVS; and M4's remaining system/control
-instructions — CHK, EXT, JMP/JSR, LINK/UNLK, MOVE to/from CCR/SR/USP,
-MOVEM, PEA, RESET, RTE, RTR, STOP, SWAP, TAS, TRAP, TRAPV. All 125
-applicable conformance files (312,500 cases) pass the state tier with 0
-unexplained failures; the only divergence is a 489-case (0.16%) gap in
-MOVE.l/MOVE.w's fault-frame instruction register field, isolated and
-documented (DESIGN.md §5.4). M5 closed the remaining cycle-tier gap: every
-state-matching case now also matches its exact cycle count, including
-DIVU/DIVS's data-dependent divide timing (DESIGN.md §5.5).
+The instruction set is complete and passes the conformance suite outright:
+**all 127 files, 317,500 cases, exact on both architectural state and cycle
+counts**, with nothing excluded, skipped or masked. That covers every family
+— MOVE/MOVEA/MOVEQ, LEA, branches and returns, NEG/NEGX/NOT/CLR/TST,
+Scc/DBcc, ADD/SUB/AND/OR/EOR/CMP and their address forms, ADDX/SUBX/CMPM, the
+immediate/CCR/SR logic ops, ASx/LSx/ROx/ROXx, BTST/BCHG/BCLR/BSET, MOVEP,
+ABCD/SBCD/NBCD, EXG, MULU/MULS/DIVU/DIVS, CHK, EXT, JMP/JSR, LINK/UNLK,
+MOVE to/from CCR/SR/USP, MOVEM, PEA, RESET, RTE, RTR, STOP, SWAP, TAS, TRAP,
+TRAPV — plus the exception machinery and data-dependent divide timing.
+
+Remaining work (milestone M6): the disassembler prints mnemonics without
+operands, so the debugger TUI is usable but rough.
 
 ## Requirements
 
@@ -54,11 +51,9 @@ zig build sst              # run everything
 zig build sst -- MOVE      # only files whose name contains "MOVE"
 ```
 
-The suite reports three tiers per file: `state` (full architectural match),
-`cycles` (exact cycle count, of the state-matching cases), and `aerr-pc`
-(the known prefetch-derived gap, DESIGN.md §5.4). The build fails only on
-unexplained failures, so the known gap stays visible without masking
-regressions.
+The suite reports two tiers per file — `state` (full architectural match) and
+`cycles` (exact cycle count) — and fails if either falls short of every case.
+Nothing is masked or excused, so any regression turns it red.
 
 ## Running the debugger
 
