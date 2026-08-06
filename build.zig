@@ -16,6 +16,29 @@ pub fn build(b: *std.Build) void {
     const core_tests = b.addTest(.{ .root_module = m68k });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
+    // Sequence-level tests, kept out of core.zig: they drive the public API
+    // over many instructions rather than testing one function.
+    const system_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/system_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "m68k", .module = m68k }},
+    }) });
+    test_step.dependOn(&b.addRunArtifact(system_tests).step);
+
+    // `zig build fuzz --fuzz` searches; plain `zig build test` runs it once on
+    // a fixed input, which is enough to keep it compiling and honest.
+    const fuzz_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/fuzz_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "m68k", .module = m68k }},
+    }) });
+    const fuzz_run = &b.addRunArtifact(fuzz_tests).step;
+    test_step.dependOn(fuzz_run);
+    b.step("fuzz", "Fuzz step() against a contract-checking bus (add --fuzz)")
+        .dependOn(fuzz_run);
+
     // --- SingleStepTests conformance harness --------------------------------
     const harness_mod = b.createModule(.{
         .root_source_file = b.path("src/harness.zig"),

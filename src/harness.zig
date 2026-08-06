@@ -3,6 +3,7 @@
 //!     tools/fetch_tests.sh          # once, clones the test data into testdata/
 //!     zig build sst                 # run everything
 //!     zig build sst -- MOVE         # only files whose name contains MOVE
+//!     zig build sst -- --coverage   # plus an opcode census of what ran
 //!
 //! Reads the upstream `.json.bin` files directly rather than going through
 //! their `decode.py`: the container is a simple tagged binary format, so
@@ -10,9 +11,10 @@
 //! JSON, and the JSON parse itself. One test is decoded and run at a time, so
 //! the whole suite runs in a fixed amount of memory.
 //!
-//! Results are reported in two tiers, architectural state (registers, SR, PC,
-//! memory) and total cycles, and every file must pass both: the counts are
-//! kept apart only so a regression says which kind it is.
+//! Results are reported in three tiers. Architectural state (registers, SR, PC,
+//! memory) and total cycles are gates: every file must pass both, and the counts
+//! are kept apart only so a regression says which kind it is. The third,
+//! data-space bus cycles, gates as well — see `compareBus`.
 
 const std = @import("std");
 const m68k = @import("m68k");
@@ -32,6 +34,16 @@ const even_bus_addr_mask = 0xFF_FFFE;
 /// Generous: the widest instruction (MOVEM of all 16 registers) touches 32
 /// words, plus an exception frame.
 const max_ram_words = 256;
+/// Same reasoning, for bus cycles rather than distinct words.
+const max_accesses = 256;
+
+/// Opcode census (`--coverage`): which of the 65,536 encodings the suite
+/// actually reached. 2500 sampled cases per family prove nothing about
+/// coverage of the decode table, and this is the cheapest way to ask. A bit
+/// per encoding is 8 KiB of always-present state, so the flag needs no
+/// allocation and costs a bit-set per case when it is on.
+var census = false;
+var executed = std.StaticBitSet(1 << 16).initEmpty();
 
 // ---------------------------------------------------------------- binary format
 
@@ -41,9 +53,67 @@ const magic_name = 0x89ABCDEF;
 const magic_state = 0x01234567;
 const magic_transactions = 0x456789AB;
 
-const DecodeError = error{ Truncated, BadMagic, TooManyRamWords };
+/// Transaction kinds inside the transactions block. Kinds 4 and 5 are the
+/// read/write halves of an address error, where the real chip never asserts AS,
+/// so no bus cycle happens and there is nothing for us to match.
+const tx_idle = 0;
+const tx_write = 1;
+const tx_read = 2;
+const tx_tas = 3;
+
+/// FC2-0 as recorded: the low two bits are the address space, 01 data,
+/// 10 program. Bit 2 is supervisor, which the space comparison ignores.
+const fc_space_mask = 0b11;
+const fc_data = 0b01;
+
+const DecodeError = error{ Truncated, BadMagic, TooManyRamWords, TooManyTransactions };
 
 const RamWord = struct { addr: u32, value: u16 };
+
+/// One bus cycle in the terms the pins see: an even address (the 68000 has no
+/// A0), the two data strobes, and the 16-bit data bus.
+pub const Access = struct {
+    addr: u24,
+    write: bool,
+    uds: bool,
+    lds: bool,
+    data: u16,
+
+    /// The half of the data bus this cycle actually drives. The other half is
+    /// undefined on hardware — a byte write duplicates the byte across both
+    /// halves on the real chip — so only the driven lane is worth comparing.
+    fn laneMask(a: Access) u16 {
+        return (if (a.uds) @as(u16, 0xFF00) else 0) | (if (a.lds) @as(u16, 0x00FF) else 0);
+    }
+
+    fn eql(a: Access, b: Access) bool {
+        return a.addr == b.addr and a.write == b.write and
+            a.uds == b.uds and a.lds == b.lds and
+            (a.data & a.laneMask()) == (b.data & b.laneMask());
+    }
+
+    /// A byte cycle drives one strobe and puts the byte on the matching half of
+    /// the data bus; an even address is UDS, an odd one LDS.
+    fn byte(addr: u24, v: u8, write: bool) Access {
+        const upper = addr & 1 == 0;
+        return .{
+            .addr = addr & ~@as(u24, 1),
+            .write = write,
+            .uds = upper,
+            .lds = !upper,
+            .data = if (upper) @as(u16, v) << 8 else v,
+        };
+    }
+
+    pub fn format(a: Access, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{s}{s} {x:0>6}={x:0>4}", .{
+            if (a.write) "w" else "r",
+            if (a.uds and a.lds) ".w" else if (a.uds) ".hi" else ".lo",
+            a.addr,
+            a.data,
+        });
+    }
+};
 
 pub const State = struct {
     d: [8]u32 = @splat(0),
@@ -63,6 +133,8 @@ pub const TestCase = struct {
     final: State,
     /// Total cycles, taken from the transaction block header.
     length: u32,
+    /// The data-space bus cycles MAME ran, in order.
+    accesses: []const Access = &.{},
 };
 
 /// Little-endian cursor over the file bytes.
@@ -108,6 +180,7 @@ const Decoder = struct {
     remaining: u32,
     ram_initial: [max_ram_words]RamWord = undefined,
     ram_final: [max_ram_words]RamWord = undefined,
+    accesses: [max_accesses]Access = undefined,
 
     fn init(buf: []const u8) DecodeError!Decoder {
         var r = Reader{ .buf = buf };
@@ -127,10 +200,16 @@ const Decoder = struct {
         const name = try d.readName();
         const initial = try d.readState(&d.ram_initial);
         const final = try d.readState(&d.ram_final);
-        const length = try d.readCycles();
+        const tx = try d.readTransactions();
         try d.r.close(test_end);
 
-        return .{ .name = name, .initial = initial, .final = final, .length = length };
+        return .{
+            .name = name,
+            .initial = initial,
+            .final = final,
+            .length = tx.cycles,
+            .accesses = tx.accesses,
+        };
     }
 
     fn readName(d: *Decoder) DecodeError![]const u8 {
@@ -166,14 +245,44 @@ const Decoder = struct {
         return s;
     }
 
-    /// Only the block's total is kept; per-cycle bus activity is outside this
-    /// emulator's accuracy target (DESIGN.md §1), so the transaction list is
-    /// skipped rather than decoded.
-    fn readCycles(d: *Decoder) DecodeError!u32 {
+    /// The block's cycle total, plus its data-space bus cycles. Per-cycle
+    /// *timing* is outside this emulator's accuracy target (DESIGN.md §1) so
+    /// the per-transaction cycle counts are dropped, but which accesses ran, in
+    /// what order and how wide, is checkable and worth checking. Program-space
+    /// cycles are the prefetch queue's, which this core does not model, so they
+    /// are left out on both sides.
+    fn readTransactions(d: *Decoder) DecodeError!struct { cycles: u32, accesses: []const Access } {
         const end = try d.r.open(magic_transactions);
         const cycles = try d.r.int(u32);
+        const count = try d.r.int(u32);
+
+        var n: usize = 0;
+        for (0..count) |_| {
+            const kind = try d.r.int(u8);
+            _ = try d.r.int(u32); // cycles this transaction took
+            if (kind == tx_idle) continue;
+
+            const fc = try d.r.int(u32);
+            const addr = try d.r.int(u32);
+            const data = try d.r.int(u32);
+            const uds = try d.r.int(u32);
+            const lds = try d.r.int(u32);
+
+            if (fc & fc_space_mask != fc_data) continue;
+            if (kind != tx_read and kind != tx_write and kind != tx_tas) continue;
+            if (n == d.accesses.len) return error.TooManyTransactions;
+            d.accesses[n] = .{
+                .addr = busAddr(addr),
+                .write = kind == tx_write,
+                .uds = uds != 0,
+                .lds = lds != 0,
+                .data = @truncate(data),
+            };
+            n += 1;
+        }
+
         try d.r.close(end);
-        return cycles;
+        return .{ .cycles = cycles, .accesses = d.accesses[0..n] };
     }
 };
 
@@ -192,6 +301,11 @@ const TrackedBus = struct {
     ram: []u8,
     dirty: [4096]u24 = undefined,
     dirty_len: usize = 0,
+    log: [max_accesses]Access = undefined,
+    log_len: usize = 0,
+    /// Which address space the next access belongs to, announced by the core
+    /// through the optional `setProgram` hook.
+    program: bool = false,
 
     fn mark(b: *TrackedBus, addr: u24) void {
         if (b.dirty_len < b.dirty.len) {
@@ -200,20 +314,39 @@ const TrackedBus = struct {
         }
     }
 
+    /// Program-space cycles are prefetches and are not logged: this core
+    /// fetches on demand rather than running a queue, so its program accesses
+    /// legitimately differ from the recorded ones.
+    fn log_access(b: *TrackedBus, a: Access) void {
+        if (b.program or b.log_len == b.log.len) return;
+        b.log[b.log_len] = a;
+        b.log_len += 1;
+    }
+
+    pub fn setProgram(b: *TrackedBus, program: bool) void {
+        b.program = program;
+    }
+
     pub fn read8(b: *TrackedBus, addr: u24) u8 {
-        return b.ram[addr];
+        const v = b.ram[addr];
+        b.log_access(.byte(addr, v, false));
+        return v;
     }
     pub fn read16(b: *TrackedBus, addr: u24) u16 {
-        return std.mem.readInt(u16, b.ram[addr..][0..2], .big);
+        const v = std.mem.readInt(u16, b.ram[addr..][0..2], .big);
+        b.log_access(.{ .addr = addr, .write = false, .uds = true, .lds = true, .data = v });
+        return v;
     }
     pub fn write8(b: *TrackedBus, addr: u24, v: u8) void {
         b.ram[addr] = v;
         b.mark(addr);
+        b.log_access(.byte(addr, v, true));
     }
     pub fn write16(b: *TrackedBus, addr: u24, v: u16) void {
         std.mem.writeInt(u16, b.ram[addr..][0..2], v, .big);
         b.mark(addr);
         b.mark(addr +% 1);
+        b.log_access(.{ .addr = addr, .write = true, .uds = true, .lds = true, .data = v });
     }
 
     /// Undoes every write since the last reset. If a single test case
@@ -227,6 +360,8 @@ const TrackedBus = struct {
             for (b.dirty[0..b.dirty_len]) |a| b.ram[a] = 0;
         }
         b.dirty_len = 0;
+        b.log_len = 0;
+        b.program = false;
     }
 };
 
@@ -240,6 +375,8 @@ fn load(s: *const State, c: *Cpu, bus: *TrackedBus) void {
     c.usp = if (c.sr.s) s.usp else s.ssp;
     c.pc = s.pc -% pc_prefetch_offset;
     for (s.ram) |w| bus.write16(busAddr(w.addr), w.value);
+    // Setting the scene is not bus activity the CPU is answerable for.
+    bus.log_len = 0;
 }
 
 const Mismatch = struct {
@@ -291,8 +428,42 @@ fn compare(s: *const State, c: *const Cpu, bus: *TrackedBus) ?Mismatch {
 
     for (s.ram) |w| {
         const addr = busAddr(w.addr);
-        const got = bus.read16(addr);
+        const got = std.mem.readInt(u16, bus.ram[addr..][0..2], .big);
         if (got != w.value) return .{ .at = .{ .ram = addr }, .expected = w.value, .actual = got };
+    }
+    return null;
+}
+
+/// Third tier: the data-space bus cycles, in order. Final memory matching does
+/// not mean the right addresses were driven, in the right order, at the right
+/// width — a read from the wrong place holding the right value, a write pair
+/// emitted back to front, or a word access where the chip does two bytes all
+/// look identical afterwards. This is the check that sees them.
+///
+/// Program-space accesses are excluded (no prefetch queue is modelled, so the
+/// fetch order legitimately differs); everything else gates like the other two
+/// tiers.
+const BusMismatch = struct {
+    index: usize,
+    expected: ?Access,
+    actual: ?Access,
+
+    pub fn format(m: BusMismatch, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("access {d}: expected ", .{m.index});
+        if (m.expected) |a| try w.print("{f}", .{a}) else try w.writeAll("none");
+        try w.writeAll(", got ");
+        if (m.actual) |a| try w.print("{f}", .{a}) else try w.writeAll("none");
+    }
+};
+
+fn compareBus(want: []const Access, bus: *const TrackedBus) ?BusMismatch {
+    const got = bus.log[0..bus.log_len];
+    for (0..@max(want.len, got.len)) |i| {
+        const w: ?Access = if (i < want.len) want[i] else null;
+        const g: ?Access = if (i < got.len) got[i] else null;
+        if (w == null or g == null or !w.?.eql(g.?)) {
+            return .{ .index = i, .expected = w, .actual = g };
+        }
     }
     return null;
 }
@@ -303,15 +474,17 @@ const Tally = struct {
     total: usize = 0,
     state_ok: usize = 0,
     cycles_ok: usize = 0,
+    bus_ok: usize = 0,
 
     fn add(t: *Tally, other: Tally) void {
         t.total += other.total;
         t.state_ok += other.state_ok;
         t.cycles_ok += other.cycles_ok;
+        t.bus_ok += other.bus_ok;
     }
 
     fn clean(t: Tally) bool {
-        return t.state_ok == t.total and t.cycles_ok == t.total;
+        return t.state_ok == t.total and t.cycles_ok == t.total and t.bus_ok == t.total;
     }
 };
 
@@ -322,6 +495,7 @@ const Reporter = struct {
     file: []const u8,
     state_shown: bool = false,
     cycles_shown: bool = false,
+    bus_shown: bool = false,
 
     fn stateFailure(rep: *Reporter, tc: TestCase, m: Mismatch) void {
         if (rep.state_shown) return;
@@ -350,6 +524,12 @@ const Reporter = struct {
             rep.file, tc.name, tc.length, actual,
         });
     }
+
+    fn busFailure(rep: *Reporter, tc: TestCase, m: BusMismatch) void {
+        if (rep.bus_shown) return;
+        rep.bus_shown = true;
+        std.debug.print("  {s}: first bus miss in \"{s}\": {f}\n", .{ rep.file, tc.name, m });
+    }
 };
 
 fn runFile(src: []const u8, ram: []u8, name: []const u8) !Tally {
@@ -367,18 +547,30 @@ fn runFile(src: []const u8, ram: []u8, name: []const u8) !Tally {
         var c: Cpu = undefined;
         load(&tc.initial, &c, &bus);
 
+        if (census) {
+            const at = c.pc & even_bus_addr_mask;
+            executed.set(std.mem.readInt(u16, bus.ram[at..][0..2], .big));
+        }
+
         Core.step(&c, &bus);
 
         tally.total += 1;
         if (compare(&tc.final, &c, &bus)) |m| {
+            // A case that got the wrong answer will have taken a wrong path
+            // too; reporting both would only bury the one that matters.
             rep.stateFailure(tc, m);
+            continue;
+        }
+        tally.state_ok += 1;
+        if (c.cycles == tc.length) {
+            tally.cycles_ok += 1;
         } else {
-            tally.state_ok += 1;
-            if (c.cycles == tc.length) {
-                tally.cycles_ok += 1;
-            } else {
-                rep.cycleFailure(tc, c.cycles);
-            }
+            rep.cycleFailure(tc, c.cycles);
+        }
+        if (compareBus(tc.accesses, &bus)) |m| {
+            rep.busFailure(tc, m);
+        } else {
+            tally.bus_ok += 1;
         }
     }
     return tally;
@@ -390,7 +582,10 @@ pub fn main(init: std.process.Init) !void {
 
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip();
-    const filter = args.next();
+    var filter: ?[]const u8 = null;
+    while (args.next()) |a| {
+        if (std.mem.eql(u8, a, "--coverage")) census = true else filter = a;
+    }
 
     var dir = std.Io.Dir.cwd().openDir(io, test_dir, .{ .iterate = true }) catch |err| {
         std.debug.print(
@@ -425,8 +620,8 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("  {s}: {t}\n", .{ entry.name, err });
             continue;
         };
-        std.debug.print("  {s:<24} state {d:>5}/{d:<5} cycles {d:>5}\n", .{
-            entry.name, t.state_ok, t.total, t.cycles_ok,
+        std.debug.print("  {s:<24} state {d:>5}/{d:<5} cycles {d:>5}  bus {d:>5}\n", .{
+            entry.name, t.state_ok, t.total, t.cycles_ok, t.bus_ok,
         });
         total.add(t);
         files += 1;
@@ -442,13 +637,36 @@ pub fn main(init: std.process.Init) !void {
         \\{d} files, {d} cases
         \\  state:  {d}/{d}
         \\  cycles: {d}/{d}
+        \\  bus:    {d}/{d}
         \\
     , .{
         files,           total.total,
         total.state_ok,  total.total,
         total.cycles_ok, total.total,
+        total.bus_ok,    total.total,
     });
+    if (census) reportCensus();
     if (!total.clean()) return error.ConformanceFailed;
+}
+
+/// How much of the decode table the run actually executed, by mnemonic. Only
+/// families with holes are listed — a full one has nothing to say. `illegal`
+/// covers every unassigned encoding, so it is never expected to be complete.
+fn reportCensus() void {
+    const fields = @typeInfo(m68k.decode.Mnemonic).@"enum".fields;
+    var seen = [_]u32{0} ** fields.len;
+    var total = [_]u32{0} ** fields.len;
+    for (0..1 << 16) |op| {
+        const i = @intFromEnum(m68k.decode.table[op].mnemonic);
+        total[i] += 1;
+        if (executed.isSet(op)) seen[i] += 1;
+    }
+
+    std.debug.print("\nopcode census: {d} of 65536 encodings executed\n", .{executed.count()});
+    inline for (fields) |f| {
+        if (seen[f.value] < total[f.value])
+            std.debug.print("  {s:<10} {d:>5} of {d:>5}\n", .{ f.name, seen[f.value], total[f.value] });
+    }
 }
 
 // ------------------------------------------------------------------------ tests
@@ -516,6 +734,91 @@ test "decoder rejects a bad header" {
     const junk = [_]u8{0} ** 16;
     try std.testing.expectError(error.BadMagic, Decoder.init(&junk));
     try std.testing.expectError(error.Truncated, Decoder.init(&.{}));
+}
+
+test "transaction block keeps data cycles and drops the rest" {
+    // Four transactions: an idle, a program read (prefetch), a supervisor data
+    // read, and a user data byte write on the low half.
+    var buf: [256]u8 = undefined;
+    var n: usize = 0;
+    const put = struct {
+        fn int(b: []u8, at: *usize, comptime T: type, v: T) void {
+            const w = @divExact(@typeInfo(T).int.bits, 8);
+            std.mem.writeInt(T, b[at.*..][0..w], v, .little);
+            at.* += w;
+        }
+    };
+    const body_start = n;
+    put.int(&buf, &n, u32, 0); // size, patched below
+    put.int(&buf, &n, u32, magic_transactions);
+    put.int(&buf, &n, u32, 20); // total cycles
+    put.int(&buf, &n, u32, 4); // transaction count
+
+    put.int(&buf, &n, u8, tx_idle);
+    put.int(&buf, &n, u32, 2);
+
+    for ([_][3]u32{
+        .{ 0b110, 0x0400, 0x4E71 }, // supervisor program: dropped
+        .{ 0b101, 0x1000, 0xCAFE }, // supervisor data word
+    }) |t| {
+        put.int(&buf, &n, u8, tx_read);
+        put.int(&buf, &n, u32, 4);
+        put.int(&buf, &n, u32, t[0]);
+        put.int(&buf, &n, u32, t[1]);
+        put.int(&buf, &n, u32, t[2]);
+        put.int(&buf, &n, u32, 1); // uds
+        put.int(&buf, &n, u32, 1); // lds
+    }
+
+    put.int(&buf, &n, u8, tx_write);
+    put.int(&buf, &n, u32, 4);
+    put.int(&buf, &n, u32, 0b001); // user data
+    put.int(&buf, &n, u32, 0x2000);
+    put.int(&buf, &n, u32, 0x0042);
+    put.int(&buf, &n, u32, 0); // uds off
+    put.int(&buf, &n, u32, 1); // lds on
+    std.mem.writeInt(u32, buf[body_start..][0..4], @intCast(n - body_start), .little);
+
+    var d = Decoder{ .r = .{ .buf = buf[0..n] }, .remaining = 0 };
+    const tx = try d.readTransactions();
+
+    try std.testing.expectEqual(@as(u32, 20), tx.cycles);
+    try std.testing.expectEqualSlices(Access, &.{
+        .{ .addr = 0x1000, .write = false, .uds = true, .lds = true, .data = 0xCAFE },
+        .{ .addr = 0x2000, .write = true, .uds = false, .lds = true, .data = 0x0042 },
+    }, tx.accesses);
+
+    // Truncating the block leaves the reader short of the last transaction.
+    var short = Decoder{ .r = .{ .buf = buf[0 .. n - 4] }, .remaining = 0 };
+    try std.testing.expectError(error.Truncated, short.readTransactions());
+}
+
+test "bus comparison ignores the undriven half of the data bus" {
+    var ram = [_]u8{0} ** 0x100;
+    var bus = TrackedBus{ .ram = &ram };
+    bus.write8(0x21, 0x42);
+    _ = bus.read16(0x20);
+
+    // A byte write on LDS: the real chip mirrors the byte onto UDS as well, and
+    // that half must not count against us.
+    try std.testing.expectEqual(@as(?BusMismatch, null), compareBus(&.{
+        .{ .addr = 0x20, .write = true, .uds = false, .lds = true, .data = 0x4242 },
+        .{ .addr = 0x20, .write = false, .uds = true, .lds = true, .data = 0x0042 },
+    }, &bus));
+
+    // A driven lane still has to match, and a missing access is reported.
+    try std.testing.expectEqual(@as(usize, 0), compareBus(&.{
+        .{ .addr = 0x20, .write = true, .uds = false, .lds = true, .data = 0x4243 },
+    }, &bus).?.index);
+    try std.testing.expectEqual(@as(?Access, null), compareBus(&.{
+        .{ .addr = 0x20, .write = true, .uds = false, .lds = true, .data = 0x0042 },
+    }, &bus).?.expected);
+
+    // Program space is the prefetch queue's, and never reaches the log.
+    bus.reset();
+    bus.setProgram(true);
+    _ = bus.read16(0x20);
+    try std.testing.expectEqual(@as(usize, 0), bus.log_len);
 }
 
 test "decoder rejects a block that runs past the file" {

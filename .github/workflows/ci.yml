@@ -34,7 +34,7 @@ jobs:
       - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
 
   test:
-    name: Test / ${{ matrix.os }} / Zig ${{ matrix.zig }}
+    name: Test / ${{ matrix.os }} / Zig ${{ matrix.zig }} / ${{ matrix.optimize }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -42,6 +42,9 @@ jobs:
       matrix:
         os: [ubuntu-latest] #os: [ubuntu-latest, ubuntu-latest]
         zig: ["0.16.0"]
+        # Debug alone leaves release codegen and its different overflow
+        # and safety semantics unverified.
+        optimize: [Debug, ReleaseSafe, ReleaseFast]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -55,14 +58,15 @@ jobs:
             .zig-cache
             ~/.cache/zig
             ~/Library/Caches/zig
-          key: zig-${{ runner.os }}-${{ matrix.zig }}-${{ hashFiles('build.zig.zon') }}
+          key: zig-${{ runner.os }}-${{ matrix.zig }}-${{ matrix.optimize }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
+            zig-${{ runner.os }}-${{ matrix.zig }}-${{ matrix.optimize }}-
             zig-${{ runner.os }}-${{ matrix.zig }}-
             zig-${{ runner.os }}-
       - name: Compile check
-        run: zig build
+        run: zig build -Doptimize=${{ matrix.optimize }}
       - name: Run tests
-        run: zig build test
+        run: zig build test -Doptimize=${{ matrix.optimize }}
 
   sst:
     name: Conformance (SingleStepTests)

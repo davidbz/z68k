@@ -117,21 +117,33 @@ pub fn Core(comptime BusT: type) type {
 
         // ---------------------------------------------------------------- bus
 
-        fn read8(ctx: *Ctx, addr: u32) u8 {
+        /// Optional bus hook: announces whether the access about to happen is
+        /// in program or data space. A bus that declares `setProgram` sees the
+        /// function-code distinction the real chip puts on FC2-0; one that does
+        /// not is unaffected, so the four-function contract stays as documented.
+        inline fn space(ctx: *Ctx, program: bool) void {
+            if (@hasDecl(BusT, "setProgram")) ctx.bus.setProgram(program);
+        }
+
+        fn read8(ctx: *Ctx, addr: u32, program: bool) u8 {
+            space(ctx, program);
             return ctx.bus.read8(@truncate(addr));
         }
 
         fn write8(ctx: *Ctx, addr: u32, v: u8) void {
+            space(ctx, false);
             ctx.bus.write8(@truncate(addr), v);
         }
 
         fn read16(ctx: *Ctx, addr: u32, program: bool) Fault!u16 {
             if (addr & 1 != 0) return addressError(ctx, addr, true, program);
+            space(ctx, program);
             return ctx.bus.read16(@truncate(addr));
         }
 
         fn write16(ctx: *Ctx, addr: u32, v: u16) Fault!void {
             if (addr & 1 != 0) return addressError(ctx, addr, false, false);
+            space(ctx, false);
             ctx.bus.write16(@truncate(addr), v);
         }
 
@@ -142,11 +154,29 @@ pub fn Core(comptime BusT: type) type {
         }
 
         fn write32(ctx: *Ctx, addr: u32, v: u32) Fault!void {
-            // -(An) writes low word first on real hardware; unobservable here
-            // since calcEa's predecrement check already faults (at addr+2,
-            // matching that ordering) before either word is written.
             try write16(ctx, addr, @truncate(v >> 16));
             try write16(ctx, addr +% 2, @truncate(v));
+        }
+
+        /// The word-at-a-time datapath puts the *low* word of a long on the
+        /// bus first. Read-modify-write instructions write back that way, as
+        /// does MOVE.l to -(An); ADDX/SUBX's -(An) pair form even reads that
+        /// way. A plain MOVE.l, a stack push and every other long read keep
+        /// the high word first (`read32`/`write32`).
+        ///
+        /// Only the conformance suite's bus tier can tell the two apart: both
+        /// words are aligned by the time either helper runs - the operand read
+        /// or `calcEa`'s predecrement check has already faulted otherwise - so
+        /// the order can never change which half commits before a fault.
+        fn read32Low(ctx: *Ctx, addr: u32) Fault!u32 {
+            const lo = try read16(ctx, addr +% 2, false);
+            const hi = try read16(ctx, addr, false);
+            return (@as(u32, hi) << 16) | lo;
+        }
+
+        fn write32Low(ctx: *Ctx, addr: u32, v: u32) Fault!void {
+            try write16(ctx, addr +% 2, @truncate(v));
+            try write16(ctx, addr, @truncate(v >> 16));
         }
 
         /// One MOVEM register transfer's worth of predecrement/postincrement
@@ -324,7 +354,7 @@ pub fn Core(comptime BusT: type) type {
 
         fn readAt(ctx: *Ctx, addr: u32, size: Size, program: bool) Fault!u32 {
             return switch (size) {
-                .byte => read8(ctx, addr),
+                .byte => read8(ctx, addr, program),
                 .word => try read16(ctx, addr, program),
                 .long => try read32(ctx, addr, program),
             };
@@ -353,7 +383,10 @@ pub fn Core(comptime BusT: type) type {
                     const pc_before = ctx.cpu.pc;
                     const addr = try calcEa(ctx, mode, reg, size, true);
                     if (src_free and mode == .abs_long) markPrefetch(ctx, pc_before, mode, true);
-                    try writeAt(ctx, addr, size, v);
+                    if (size == .long and mode == .addr_predec)
+                        try write32Low(ctx, addr, v)
+                    else
+                        try writeAt(ctx, addr, size, v);
                 },
             }
         }
@@ -385,7 +418,10 @@ pub fn Core(comptime BusT: type) type {
             fn writeBack(o: RmwOperand, ctx: *Ctx, size: Size, v: u32) Fault!void {
                 switch (o.loc) {
                     .reg => |r| setReg(&ctx.cpu.d[r], size, v),
-                    .mem => |addr| try writeAt(ctx, addr, size, v),
+                    .mem => |addr| if (size == .long)
+                        try write32Low(ctx, addr, v)
+                    else
+                        try writeAt(ctx, addr, size, v),
                 }
             }
         };
@@ -438,17 +474,31 @@ pub fn Core(comptime BusT: type) type {
                 return;
             };
 
-            c.pc = read32(&ctx, e.vectorAddr(), true) catch {
+            // The vector fetch is supervisor *data* space on the real chip, not
+            // program space. It cannot fault (every vector address is a
+            // multiple of four), so the flag only reaches the `setProgram` hook.
+            c.pc = read32(&ctx, e.vectorAddr(), false) catch {
                 c.halted = true;
                 return;
             };
             c.cycles += exceptionCycles(e);
         }
 
+        /// Builds the exception frame. The microcode does not push it in stack
+        /// order: it writes the low word of each stacked long, then an
+        /// unrelated word, then the high word. Only the bus sees the
+        /// difference, and only the conformance suite's transaction tier sees
+        /// that (DESIGN.md §5.6), but it costs nothing to get right.
         fn frame(ctx: *Ctx, old_sr: cpu_mod.StatusRegister, e: Exception, g0: ?Group0Info) Fault!void {
+            const pc = ctx.cpu.pc;
+
             if (!e.isGroup0()) {
-                try push32(ctx, ctx.cpu.pc);
-                try push16(ctx, old_sr.toInt());
+                // [sp] SR, [sp+2] PC. Written PC low, SR, PC high.
+                ctx.cpu.a[7] -%= 6;
+                const sp = ctx.cpu.a[7];
+                try write16(ctx, sp +% 4, @truncate(pc));
+                try write16(ctx, sp, old_sr.toInt());
+                try write16(ctx, sp +% 2, @truncate(pc >> 16));
                 return;
             }
 
@@ -458,17 +508,24 @@ pub fn Core(comptime BusT: type) type {
                 .read = true,
                 .program = true,
             };
-            try push32(ctx, ctx.cpu.pc);
-            try push16(ctx, old_sr.toInt());
-            try push16(ctx, info.ir);
-            try push32(ctx, info.access_addr);
             // Special status word: R/W, I/N and the three FC pins, see
             // Group0Info's ssw_* constants for the bit layout.
             const ssw: u16 = (info.ir & cpu_mod.ssw_ir_residue_mask) |
                 (if (info.read) cpu_mod.ssw_rw_read else 0) |
                 (if (info.program) cpu_mod.ssw_fc_program else cpu_mod.ssw_fc_data) |
                 (if (old_sr.s) cpu_mod.ssw_fc_supervisor else 0);
-            try push16(ctx, ssw);
+
+            // [sp] SSW, [sp+2] access address, [sp+6] IR, [sp+8] SR, [sp+10] PC.
+            // The same low/other/high interleave, applied to both longs.
+            ctx.cpu.a[7] -%= 14;
+            const sp = ctx.cpu.a[7];
+            try write16(ctx, sp +% 12, @truncate(pc));
+            try write16(ctx, sp +% 8, old_sr.toInt());
+            try write16(ctx, sp +% 10, @truncate(pc >> 16));
+            try write16(ctx, sp +% 6, info.ir);
+            try write16(ctx, sp +% 4, @truncate(info.access_addr));
+            try write16(ctx, sp, ssw);
+            try write16(ctx, sp +% 2, @truncate(info.access_addr >> 16));
         }
 
         // ------------------------------------------------------------ interrupts
@@ -538,6 +595,10 @@ pub fn Core(comptime BusT: type) type {
                     // Past the mark, real hardware has already prefetched the
                     // next opcode into IR and advanced PC past it; before the
                     // mark, both still reflect the faulting instruction itself.
+                    // Re-reading the opcode is bookkeeping, not a bus cycle the
+                    // chip runs here: it re-reads what the original prefetch
+                    // already brought in, so it counts as program space.
+                    space(&ctx, true);
                     if (ctx.prefetch) |p| {
                         info.ir = p.ir orelse bus.read16(@truncate(start_pc & ~@as(u32, 1)));
                         c.pc = p.pc;
@@ -729,7 +790,10 @@ pub fn Core(comptime BusT: type) type {
                 // extension words then overlap that access differently.
                 errdefer if (dst_mode == .addr_predec) {
                     if (size == .word) {
-                        if (ctx.prefetch) |*p| p.ir = ctx.bus.read16(@truncate(ctx.cpu.pc));
+                        if (ctx.prefetch) |*p| {
+                            space(ctx, true); // the next opcode: a prefetch
+                            p.ir = ctx.bus.read16(@truncate(ctx.cpu.pc));
+                        }
                         ctx.cpu.cycles += 4;
                     }
                 } else {
@@ -873,6 +937,10 @@ pub fn Core(comptime BusT: type) type {
                 // computes its address ahead of the bus cycle.
                 ctx.cpu.cycles += mode.cycles(.byte);
                 const addr = try calcEa(ctx, mode, reg, .byte, false);
+                // Scc's memory form is a read-modify-write on the bus: the
+                // destination byte is read and discarded before the store.
+                // Byte reads never fault, so only the bus tier sees it.
+                _ = readAt(ctx, addr, .byte, false) catch unreachable;
                 try writeAt(ctx, addr, .byte, v);
             }
         }
@@ -1297,7 +1365,7 @@ pub fn Core(comptime BusT: type) type {
         /// rest of that instruction's dual-predecrement bus ordering.
         fn predecLongRead(ctx: *Ctx, addr: u32) Fault!u32 {
             if (addr & 1 != 0) return addressError(ctx, addr +% 2, true, false);
-            return read32(ctx, addr, false);
+            return read32Low(ctx, addr);
         }
 
         /// ADDX/SUBX: Dy,Dx (register-register) or -(Ay),-(Ax) (memory pair,
@@ -1349,7 +1417,7 @@ pub fn Core(comptime BusT: type) type {
                     ctx.fault.?.read = true;
                     return e;
                 };
-                dst = try readAt(ctx, dst_addr, size, false);
+                dst = try read32Low(ctx, dst_addr);
             } else if (mem_form) {
                 const src_addr = try calcEa(ctx, .addr_predec, ry, size, false);
                 // Byte accesses never fault (no alignment check), so these
@@ -1376,7 +1444,7 @@ pub fn Core(comptime BusT: type) type {
             const value = if (is_sub) (dst -% src -% x) & size.mask() else (dst +% src +% x) & size.mask();
 
             if (mem_form) {
-                try writeAt(ctx, dst_addr, size, value);
+                if (size == .long) try write32Low(ctx, dst_addr, value) else try writeAt(ctx, dst_addr, size, value);
             } else {
                 setReg(&ctx.cpu.d[rx], size, value);
             }
@@ -1643,7 +1711,8 @@ pub fn Core(comptime BusT: type) type {
             } else {
                 var v: u32 = 0;
                 var i: u32 = 0;
-                while (i < n) : (i += 1) v = (v << 8) | read8(ctx, base +% i * 2);
+                // MOVEP's only addressing mode is d(An): data space, always.
+                while (i < n) : (i += 1) v = (v << 8) | read8(ctx, base +% i * 2, false);
                 setReg(&ctx.cpu.d[dn], instr.size, v);
             }
         }
@@ -2060,9 +2129,23 @@ pub fn Core(comptime BusT: type) type {
                     const v = if (is_addr and rn == reg and predec)
                         orig_an
                     else if (is_addr) ctx.cpu.a[rn] else ctx.cpu.d[rn];
-                    try writeAt(ctx, cur, size, v);
+                    if (size == .long and predec)
+                        try write32Low(ctx, cur, v)
+                    else
+                        try writeAt(ctx, cur, size, v);
                 }
             }
+
+            // Loading always runs one word read past the end of the list and
+            // throws the result away - the microcode reads the next operand
+            // before it notices the mask is exhausted. It is pure bus
+            // activity: no register changes and the flat base_cycles already
+            // pays for it. Skipped when the tail address is odd (only
+            // reachable with an empty mask, since any real transfer would
+            // have faulted first) rather than guess at hardware we have no
+            // recording of.
+            const tail = if (postinc) ctx.cpu.a[reg] else addr;
+            if (load and tail & 1 == 0) _ = try read16(ctx, tail, mode.isProgram());
 
             ctx.cpu.cycles += @as(u64, count) * (if (size == .long) @as(u64, 8) else 4);
         }

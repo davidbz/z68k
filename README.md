@@ -7,16 +7,21 @@ knowledge of any particular machine: the host supplies the bus.
 Accuracy is validated against the MAME-generated
 [SingleStepTests/m68000](https://github.com/SingleStepTests/m68000) suite, at
 the level of architectural state (registers, SR, PC, memory) and total
-per-instruction cycle counts. Per-cycle bus activity isn't modelled; a
+per-instruction cycle counts. Per-cycle bus *timing* isn't modelled; a
 prefetch-queue approximation reproduces the fault-frame effects it has,
 including the group 0 exception frame's PC, instruction register and
 mid-microcode CCR. See [DESIGN.md](DESIGN.md) for the rationale.
 
+A third tier compares the data-space bus cycles themselves — which addresses
+were driven, in what order, on which strobes — against the same recordings.
+It passes outright too; see [DESIGN.md §5.6](DESIGN.md) for the hardware
+quirks it turned up.
+
 ## Status
 
 The instruction set is complete and passes the conformance suite outright:
-**all 127 files, 317,500 cases, exact on both architectural state and cycle
-counts**, with nothing excluded, skipped or masked. That covers every family
+**all 127 files, 317,500 cases, exact on architectural state, cycle counts and
+data-space bus cycles**, with nothing excluded, skipped or masked. That covers every family
 — MOVE/MOVEA/MOVEQ, LEA, branches and returns, NEG/NEGX/NOT/CLR/TST,
 Scc/DBcc, ADD/SUB/AND/OR/EOR/CMP and their address forms, ADDX/SUBX/CMPM, the
 immediate/CCR/SR logic ops, ASx/LSx/ROx/ROXx, BTST/BCHG/BCLR/BSET, MOVEP,
@@ -33,8 +38,9 @@ No other dependencies.
 ## Building
 
 ```sh
-zig build          # library + executables into zig-out/
-zig build test     # unit tests
+zig build              # library + executables into zig-out/
+zig build test         # unit, sequence and soak tests
+zig build fuzz --fuzz  # coverage-guided fuzzing (see src/fuzz_test.zig)
 ```
 
 ## Running the conformance suite
@@ -45,11 +51,13 @@ The test data (~2 GB) is fetched once into `testdata/` (gitignored):
 tools/fetch_tests.sh
 zig build sst              # run everything
 zig build sst -- MOVE      # only files whose name contains "MOVE"
+zig build sst -- --coverage  # plus an opcode census of what actually ran
 ```
 
-The suite reports two tiers per file — `state` (full architectural match) and
-`cycles` (exact cycle count) — and fails if either falls short of every case.
-Nothing is masked or excused, so any regression turns it red.
+The suite gates on three tiers per file — `state` (full architectural match),
+`cycles` (exact cycle count) and `bus` (every data-space bus cycle, in order)
+— and fails if any falls short of every case. Nothing is masked or excused, so
+any regression turns it red.
 
 ## Using the library
 
@@ -83,6 +91,8 @@ src/decode.zig     EaMode, comptime 64K-entry decode table  (data + pure fns)
 src/flags.zig      condition-code computation               (pure fns)
 src/core.zig       Core(BusT): step/run/reset/EA/exceptions (logic)
 src/harness.zig    SingleStepTests conformance runner
+src/system_test.zig  interrupts, STOP, trace, reset, halted   (sequences)
+src/fuzz_test.zig    step() vs. a contract-checking bus       (invariants)
 ```
 
 Design in one paragraph: all state lives in plain copyable structs and all
