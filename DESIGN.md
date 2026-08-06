@@ -8,10 +8,9 @@ Sega Genesis emulator (separate repo). Toolchain: Zig 0.16.0.
 - **Data-oriented design.** All state lives in plain, copyable data structs. All
   logic lives in free functions taking `*Cpu` plus a bus. No methods hiding
   state, no globals, no allocation inside the core. A `Cpu` can be memcpy'd for
-  snapshot/rewind in the debugger.
+  snapshot/rewind.
 - **Library first** (lesson from rocket68): the core is a Zig module with zero
-  dependencies. The TUI debugger and the test harness are separate executables
-  that depend on it.
+  dependencies. The test harness is a separate executable that depends on it.
 - **Accuracy target: architectural state + total cycle counts.** Registers,
   memory, SR, PC, and per-instruction cycle totals are validated against
   [SingleStepTests/m68000](https://github.com/SingleStepTests/m68000). The
@@ -28,11 +27,10 @@ Sega Genesis emulator (separate repo). Toolchain: Zig 0.16.0.
                  ┌─────────────────────────────┐
                  │  m68k module (no deps)      │
                  │                             │
-  ┌──────────┐   │  cpu.zig     data objects   │   ┌─────────────┐
-  │ TUI      │──▶│  decode.zig  opcode → instr │◀──│ SST harness │
-  │ debugger │   │  flags.zig   pure CCR logic │   │ harness.zig │
-  │ (vaxis)  │   │  core.zig    step/run/traps │   └─────────────┘
-  └──────────┘   │  disasm.zig  pure disasm    │
+                 │  cpu.zig     data objects   │   ┌─────────────┐
+                 │  decode.zig  opcode → instr │◀──│ SST harness │
+                 │  flags.zig   pure CCR logic │   │ harness.zig │
+                 │  core.zig    step/run/traps │   └─────────────┘
                  └─────────────────────────────┘
                             ▲
                        bus: anytype
@@ -43,15 +41,13 @@ Sega Genesis emulator (separate repo). Toolchain: Zig 0.16.0.
 File layout:
 
 ```
-build.zig, build.zig.zon   module `m68k`; exe `z68k-dbg`; steps `test`, `sst`
+build.zig, build.zig.zon   module `m68k`; exe `z68k-sst`; steps `test`, `sst`
 src/root.zig               public surface
 src/cpu.zig                Cpu, StatusRegister, Size, Exception   (data)
 src/decode.zig             pattern tables, EaMode, comptime table (data + pure fns)
 src/flags.zig              pure flag computation                  (pure fns)
 src/core.zig               Core(BusT): step/run/reset/EA/traps    (logic)
-src/disasm.zig             disassembler                           (pure fns)
 src/harness.zig            SingleStepTests runner
-src/tui/main.zig           libvaxis debugger
 tools/fetch_tests.sh       clone + decode test data → testdata/ (gitignored)
 ```
 
@@ -258,21 +254,6 @@ pub const TestCase = struct {
 Both `State`s point into buffers owned by the decoder and are overwritten by the
 next test — nothing is allocated per case.
 
-### 3.9 Debugger data (`tui/`, not core)
-
-```zig
-const Debug = struct {
-    cpu: Cpu,
-    prev: Cpu,              // last-step snapshot → changed-register highlighting
-    breakpoints: std.ArrayList(u32),
-    mem_cursor: u32,
-    running: bool,
-    quit: bool,
-};
-```
-
-An execution-history ring for step-back is planned for M6.
-
 ## 4. Business Logic Flows
 
 All core logic lives in a generic namespace:
@@ -322,7 +303,7 @@ pub const Fault = error{ AddressError, IllegalInstruction, LineA, LineF };
 needs (faulting address, R/W, program vs data space) rides in `Ctx`, a transient
 per-instruction struct holding `*Cpu`, `*BusT`, the current opcode, and the
 fault info. `Ctx` is deliberately **not** part of `Cpu`: `Cpu` stays a clean
-snapshot of architectural state that the debugger can copy for step-back.
+snapshot of architectural state.
 
 Illegal-instruction-class faults (illegal, line A, line F — later privilege)
 stack the address of the *offending* instruction, so the catch rewinds `pc` to
@@ -459,43 +440,6 @@ there. Cycle bases come from Musashi's tables / the M68000UM.
 | ASx/LSx/ROx/ROXx (reg & mem forms) | `1110` | reg form: 6/8 + 2·count |
 | line-A / line-F | `1010/1111` | → vectors 10/11 |
 
-### 4.9 Disassembler (`disasm.zig`)
-
-Pure and core-independent — usable by the TUI against any memory snapshot:
-
-```zig
-pub fn disasm(read16: anytype, pc: u32) Line;  // Line: fixed 64-byte text buffer
-                                               // + instruction length in bytes
-```
-
-Shares the decode pattern data from `decode.zig`; formats Motorola syntax
-(`move.w d0,$1234(a0)`). Stub initially returns `dc.w $XXXX`.
-
-### 4.10 TUI debugger (`src/tui/`, libvaxis)
-
-[libvaxis](https://github.com/rockorager/libvaxis) low-level API (own event
-loop, cell-level control — a debugger wants exact layout, so vxfw widgets are
-skipped). Main branch targets Zig 0.16.0, matching our toolchain.
-
-```
-┌ registers ──────────┬ disassembly ────────────────────┐
-│ D0 00000000  A0 …   │   00400: move.w #$1234,d0       │
-│ …                   │ ▶ 00404: add.w  d1,d0           │
-│ PC 00000404         │ ● 00408: bne.s  $00420          │  ● = breakpoint
-│ SR --S--210 X-ZVC   │   …                             │  ▶ = pc
-├ memory ─────────────┴─────────────────────────────────┤
-│ 00FF0000: 12 34 56 78 …  |.4Vx…|                      │
-├───────────────────────────────────────────────────────┤
-│ cycles: 123456   [s]tep [r]un [b]reak [g]oto [q]uit   │
-└───────────────────────────────────────────────────────┘
-```
-
-Event loop: key event → mutate `DebugState`/call `step`/`run` (with a
-breakpoint check per instruction when running) → redraw. Registers changed
-since the previous step render highlighted (diff vs `DebugState.prev`).
-Program loading: raw binary at a given address (S-record support later, per
-rocket68's loader scope).
-
 ## 5. Test Plan
 
 ### 5.1 Unit tests (inline `test` blocks, `zig build test`)
@@ -604,12 +548,9 @@ bus into the ALU.
 | M3 | shifts, bits, BCD, EXG, MUL/DIV | their files pass state tier |
 | M4 | prefetch queue; remaining exceptions | **all** files pass state tier |
 | M5 | cycle tables tightened | all files pass cycle tier |
-| M6 | TUI debugger | interactive session against a test ROM |
 
-**Current status: M1–M5 done.** All 127 upstream files, 317500 cases, pass
-both tiers exactly — no exclusions, no skips, no masked fields (§5.2). M6 is
-the only milestone outstanding; `disasm.zig` still prints mnemonics without
-operands.
+**Current status: all milestones done.** All 127 upstream files, 317500 cases,
+pass both tiers exactly — no exclusions, no skips, no masked fields (§5.2).
 
 The rest of this section records the rules that were derived from conformance
 data rather than from the manual, because the code implementing them looks
@@ -666,5 +607,4 @@ instruction-specific corrections to reach the cycle tier:
 - [SingleStepTests/m68000](https://github.com/SingleStepTests/m68000) — MAME-generated per-opcode JSON conformance tests
 - [Musashi](https://github.com/kstenerud/Musashi) — architecture reference: generated dispatch, memory callbacks, timeslices
 - [rocket68](https://github.com/habedi/rocket68) — API-shape reference: single-struct state, library-first, reset semantics
-- [libvaxis](https://github.com/rockorager/libvaxis) — TUI library (Zig 0.16)
 - M68000UM — Motorola 68000 User's Manual (instruction set, cycle tables, exception frames)

@@ -24,15 +24,11 @@ ABCD/SBCD/NBCD, EXG, MULU/MULS/DIVU/DIVS, CHK, EXT, JMP/JSR, LINK/UNLK,
 MOVE to/from CCR/SR/USP, MOVEM, PEA, RESET, RTE, RTR, STOP, SWAP, TAS, TRAP,
 TRAPV — plus the exception machinery and data-dependent divide timing.
 
-Remaining work (milestone M6): the disassembler prints mnemonics without
-operands, so the debugger TUI is usable but rough.
-
 ## Requirements
 
 - Zig 0.16.0
 
-No other dependencies for the core. The debugger TUI pulls in
-[libvaxis](https://github.com/rockorager/libvaxis) via the Zig package manager.
+No other dependencies.
 
 ## Building
 
@@ -54,17 +50,6 @@ zig build sst -- MOVE      # only files whose name contains "MOVE"
 The suite reports two tiers per file — `state` (full architectural match) and
 `cycles` (exact cycle count) — and fails if either falls short of every case.
 Nothing is masked or excused, so any regression turns it red.
-
-## Running the debugger
-
-```sh
-zig build dbg -- program.bin [load-address]
-```
-
-Loads a raw binary (default address `0x400`) into a flat 16 MiB RAM and opens
-a TUI with register, disassembly, and memory panes. Keys: `s` step, `r` run,
-`b` toggle breakpoint at PC, `m`/`n` scroll memory, `g` jump memory view to PC,
-`q` quit.
 
 ## Using the library
 
@@ -97,9 +82,7 @@ src/cpu.zig        Cpu, StatusRegister, Size, Exception     (data)
 src/decode.zig     EaMode, comptime 64K-entry decode table  (data + pure fns)
 src/flags.zig      condition-code computation               (pure fns)
 src/core.zig       Core(BusT): step/run/reset/EA/exceptions (logic)
-src/disasm.zig     disassembler                             (pure fns)
 src/harness.zig    SingleStepTests conformance runner
-src/tui/main.zig   libvaxis debugger
 ```
 
 Design in one paragraph: all state lives in plain copyable structs and all
@@ -115,7 +98,6 @@ design document, including the test plan and milestone gates, is
 - [SingleStepTests/m68000](https://github.com/SingleStepTests/m68000) — MAME-generated per-opcode conformance tests
 - [Musashi](https://github.com/kstenerud/Musashi) — architecture reference
 - [rocket68](https://github.com/habedi/rocket68) — API-shape reference
-- [libvaxis](https://github.com/rockorager/libvaxis) — TUI library
 - M68000UM — Motorola 68000 User's Manual (instruction set, cycle tables, exception frames)
 
 ## License
