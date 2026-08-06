@@ -17,3 +17,6 @@ zig-out/
 
 # SingleStepTests conformance data (tools/fetch_tests.sh)
 testdata/
+
+# DiagROM and friends (tools/fetch_diagrom.sh)
+roms/

@@ -59,4 +59,20 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| sst_run.addArgs(args);
     b.step("sst", "Run the SingleStepTests conformance suite (needs testdata/)")
         .dependOn(&sst_run.step);
+
+    // --- examples ------------------------------------------------------------
+    const amiga = b.addExecutable(.{ .name = "z68k-amiga", .root_module = b.createModule(.{
+        .root_source_file = b.path("examples/amiga.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "m68k", .module = m68k }},
+    }) });
+    b.installArtifact(amiga);
+
+    const amiga_run = b.addRunArtifact(amiga);
+    amiga_run.setCwd(b.path(".")); // roms/ is resolved relative to the project
+    amiga_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| amiga_run.addArgs(args);
+    b.step("amiga", "Boot an Amiga ROM (needs roms/; see examples/amiga.zig)")
+        .dependOn(&amiga_run.step);
 }
