@@ -16,6 +16,16 @@ pub fn build(b: *std.Build) void {
     const core_tests = b.addTest(.{ .root_module = m68k });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
+    // Sequence-level tests, kept out of core.zig: they drive the public API
+    // over many instructions rather than testing one function.
+    const system_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/system_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "m68k", .module = m68k }},
+    }) });
+    test_step.dependOn(&b.addRunArtifact(system_tests).step);
+
     // --- SingleStepTests conformance harness --------------------------------
     const harness_mod = b.createModule(.{
         .root_source_file = b.path("src/harness.zig"),
