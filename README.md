@@ -14,8 +14,8 @@ known remaining divergence this causes.
 
 ## Status
 
-Early development (milestone M4 of 6, decode/state coverage complete): the
-full `0100`-line instruction set now has handlers — M1's decode table,
+Early development (milestone M5 of 6, cycle tables tightened): the full
+`0100`-line instruction set now has handlers — M1's decode table,
 MOVE/MOVEA/MOVEQ, LEA, branches, RTS and exception machinery; the M2 ALU
 families — NEG/NEGX/NOT/CLR/TST, Scc/DBcc, ADD/SUB/AND/OR/EOR/CMP (and their
 address forms), ADDX/SUBX/CMPM, and the immediate/CCR/SR logic ops; the M3
@@ -26,9 +26,9 @@ MOVEM, PEA, RESET, RTE, RTR, STOP, SWAP, TAS, TRAP, TRAPV. All 125
 applicable conformance files (312,500 cases) pass the state tier with 0
 unexplained failures; the only divergence is a 489-case (0.16%) gap in
 MOVE.l/MOVE.w's fault-frame instruction register field, isolated and
-documented (DESIGN.md §5.4). Cycle-tier accuracy still trails state tier for
-a handful of read-modify-write and operand-dependent-cost forms (see
-DESIGN.md §5.5), left for M5.
+documented (DESIGN.md §5.4). M5 closed the remaining cycle-tier gap: every
+state-matching case now also matches its exact cycle count, including
+DIVU/DIVS's data-dependent divide timing (DESIGN.md §5.5).
 
 ## Requirements
 

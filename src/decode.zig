@@ -391,10 +391,12 @@ pub fn decodeOne(op: u16) Instr {
                     break :blk .{
                         .mnemonic = m,
                         .size = size,
-                        .base_cycles = switch (m) {
-                            .tst => 4,
-                            else => if (size == .long) @as(u8, 6) else 4,
-                        },
+                        // Flat base for every size: NEGX/CLR/NEG/NOT's long
+                        // form pays 2 more, but only once a faulting read is
+                        // no longer possible, so the handler adds that (and
+                        // any memory write-back extra) itself after the read
+                        // succeeds — see `opAluSingle`.
+                        .base_cycles = 4,
                     };
                 }
 
@@ -438,16 +440,12 @@ pub fn decodeOne(op: u16) Instr {
             break :blk .{
                 .mnemonic = if (is_sub) .subq else .addq,
                 .size = size,
-                // Dn baseline; the handler adds the addressing-mode cost on
-                // top for a memory destination. An destination is always
-                // treated as long, takes no flags, and (a real hardware
-                // asymmetry) costs SUBQ.w double what ADDQ.w costs — a fixed
-                // special case rather than something the usual EA cost table
-                // composes cleanly.
-                .base_cycles = switch (ea) {
-                    .addr_reg => if (size == .long) @as(u8, 8) else if (is_sub) @as(u8, 8) else @as(u8, 4),
-                    else => if (size == .long) @as(u8, 8) else @as(u8, 4),
-                },
+                // An destination is always a flat 8 (word treated as long,
+                // no flags, no possible fault); everything else is a flat 4,
+                // with the handler adding the addressing-mode cost and the
+                // long/write-back bonus once a faulting read can no longer
+                // happen (same shape as `opAlu2`'s RMW branch).
+                .base_cycles = if (ea == .addr_reg) @as(u8, 8) else 4,
             };
         },
 
@@ -478,9 +476,12 @@ pub fn decodeOne(op: u16) Instr {
                     const size: Size = @enumFromInt(opmode);
                     const allowed = if (size == .byte) ea_data else ea_all;
                     if (!allowed.contains(ea)) break :blk illegal;
-                    break :blk .{ .mnemonic = .cmp, .size = size, .base_cycles = if (size == .long) @as(u8, 6) else 4 };
+                    break :blk .{ .mnemonic = .cmp, .size = size, .base_cycles = 4 };
                 },
-                3 => break :blk .{ .mnemonic = .cmpa, .size = .word, .base_cycles = 6 },
+                // Flat base; the handler adds a uniform +2 once a faulting
+                // read can no longer happen (same value for every EA kind
+                // and either size, unlike ADDA/SUBA's bonus).
+                3 => break :blk .{ .mnemonic = .cmpa, .size = .word, .base_cycles = 4 },
                 4, 5, 6 => {
                     // CMPM reuses this direction's byte/word/long slots at
                     // ea==addr_reg: the (Ay)+,(Ax)+ pair form: a plain read,
@@ -488,26 +489,18 @@ pub fn decodeOne(op: u16) Instr {
                     // own data_reg case just below.
                     const size: Size = @enumFromInt(opmode - 4);
                     if (ea == .addr_reg) {
-                        break :blk .{
-                            .mnemonic = .cmpm,
-                            .size = size,
-                            .base_cycles = if (size == .long) @as(u8, 20) else 12,
-                        };
+                        // Flat fixed overhead only: CMPM has two independent
+                        // (An)+ reads, each of which can fault on its own, so
+                        // their EA costs are charged and (on fault) unwound
+                        // separately in the handler rather than baked in here.
+                        break :blk .{ .mnemonic = .cmpm, .size = size, .base_cycles = 4 };
                     }
                     if (!ea_data_alterable.contains(ea)) break :blk illegal;
-                    break :blk .{
-                        .mnemonic = .eor,
-                        .size = size,
-                        // EOR.l to Dn is a real hardware outlier: 8, not the
-                        // usual 6, since the register is read and written in
-                        // the same cycle slot.
-                        .base_cycles = switch (size) {
-                            .long => if (ea == .data_reg) @as(u8, 8) else @as(u8, 6),
-                            else => 4,
-                        },
-                    };
+                    // Flat base; the handler adds the long/write-back extras,
+                    // including EOR.l to Dn's own outlier (see `opAlu2`).
+                    break :blk .{ .mnemonic = .eor, .size = size, .base_cycles = 4 };
                 },
-                7 => break :blk .{ .mnemonic = .cmpa, .size = .long, .base_cycles = 6 },
+                7 => break :blk .{ .mnemonic = .cmpa, .size = .long, .base_cycles = 4 },
             }
         },
 
@@ -541,9 +534,13 @@ fn decodeAluLine(op: u16, mode: u3, reg: u3, er_mn: Mnemonic, re_mn: Mnemonic, a
             const size: Size = @enumFromInt(opmode);
             const allowed = if (size == .byte) ea_data else ea_all;
             if (!allowed.contains(ea)) break :blk illegal;
-            break :blk .{ .mnemonic = er_mn, .size = size, .base_cycles = if (size == .long) @as(u8, 6) else 4 };
+            // Flat base; long's extra 2-cycle ALU pass is added by the
+            // handler once a faulting read can no longer happen.
+            break :blk .{ .mnemonic = er_mn, .size = size, .base_cycles = 4 };
         },
-        3 => if (a_mn) |m| .{ .mnemonic = m, .size = .word, .base_cycles = 8 } else illegal,
+        // Flat base; the handler adds the size/EA-dependent bonus (see
+        // `opAluA`) once a faulting read can no longer happen.
+        3 => if (a_mn) |m| .{ .mnemonic = m, .size = .word, .base_cycles = 4 } else illegal,
         4, 5, 6 => blk: {
             const size: Size = @enumFromInt(opmode - 4);
             if (x_mn) |xm| {
@@ -555,9 +552,12 @@ fn decodeAluLine(op: u16, mode: u3, reg: u3, er_mn: Mnemonic, re_mn: Mnemonic, a
                 }
             }
             if (!ea_memory_alterable.contains(ea)) break :blk illegal;
-            break :blk .{ .mnemonic = re_mn, .size = size, .base_cycles = if (size == .long) @as(u8, 6) else 4 };
+            // Flat base; the handler adds long's extra ALU pass and the
+            // memory write-back cost once the (possibly faulting) read
+            // succeeds.
+            break :blk .{ .mnemonic = re_mn, .size = size, .base_cycles = 4 };
         },
-        7 => if (a_mn) |m| .{ .mnemonic = m, .size = .long, .base_cycles = 6 } else illegal,
+        7 => if (a_mn) |m| .{ .mnemonic = m, .size = .long, .base_cycles = 4 } else illegal,
     };
 }
 
@@ -711,30 +711,26 @@ fn decodeImmediateAlu(op: u16, mode: u3, reg: u3) Instr {
     const ea = EaMode.decode(mode, reg) orelse return illegal;
     if (!ea_data_alterable.contains(ea)) return illegal;
 
-    // Dn destination cost includes the immediate fetch; ANDI.l and CMPI.l are
-    // real hardware outliers (14, not the 16 the other long ops take). Memory
-    // destination's own extra cost is added by the handler via the usual EA
-    // cost table on top of this base.
-    const base_dn: u8 = switch (size) {
-        .byte, .word => 8,
-        .long => if (m == .andi or m == .cmpi) @as(u8, 14) else @as(u8, 16),
-    };
-    const base_mem: u8 = switch (size) {
-        .byte, .word => 8,
-        .long => 12,
-    };
+    // Same base whether the destination is Dn or memory: it covers just the
+    // immediate fetch plus flat overhead, word-sized either way. A faulting
+    // memory read never reaches long's extra ALU pass, a memory
+    // destination's write-back cost, or (Dn only) CMPI.l's smaller version
+    // of that same long bonus — the handler adds all of those only once it
+    // knows the read succeeded (or, for Dn, never risked faulting at all).
     return .{
         .mnemonic = m,
         .size = size,
-        .base_cycles = if (ea == .data_reg) base_dn else base_mem,
+        .base_cycles = if (size == .long) 12 else 8,
     };
 }
 
 /// MOVEM register list <-> memory. `load` picks the mem->reg direction
 /// (control EAs plus postincrement); store (reg->mem) allows control EAs
-/// plus predecrement instead. Base cost is a per-register 4, doubled for
-/// long; the handler adds 2 more per register actually transferred plus
-/// this floor already covers the fixed ea/extension-word overhead.
+/// plus predecrement instead. Base is a flat 12 (load) or 8 (store) plus
+/// this EA's own one-off extension-word fetch cost (`destCycles(.word)-4`,
+/// always word-sized regardless of the transfer size: it's paid once for
+/// the address, not per register); the handler adds 4 or 8 more per
+/// register actually transferred.
 fn decodeMovem(mode: u3, reg: u3, size: Size, load: bool) Instr {
     const ea = EaMode.decode(mode, reg) orelse return illegal;
     const ok = if (load)
@@ -742,7 +738,8 @@ fn decodeMovem(mode: u3, reg: u3, size: Size, load: bool) Instr {
     else
         ea_control.intersectWith(ea_alterable).contains(ea) or ea == .addr_predec;
     if (!ok) return illegal;
-    return .{ .mnemonic = .movem, .size = size, .base_cycles = if (load) 12 else 8 };
+    const ext = ea.destCycles(.word) - 4;
+    return .{ .mnemonic = .movem, .size = size, .base_cycles = (if (load) @as(u8, 12) else 8) + ext };
 }
 
 /// MOVE from SR: 0100000011 mmm rrr, the size=11 slot under NEGX's prefix.
@@ -856,8 +853,8 @@ test "quick and conditional forms (0101 line)" {
     // subq.w #1,a0 — An destination allowed for word/long, not byte.
     try std.testing.expectEqual(Mnemonic.subq, table[0x5348].mnemonic);
     try std.testing.expectEqual(@as(u8, 8), table[0x5348].base_cycles);
-    // addq.w #1,a0 costs half what subq.w does to An (real asymmetry).
-    try std.testing.expectEqual(@as(u8, 4), table[0x5248].base_cycles);
+    // addq.w #1,a0 — An destination is a flat 8 for either op (no asymmetry).
+    try std.testing.expectEqual(@as(u8, 8), table[0x5248].base_cycles);
     // addq.b #1,a0 — byte can't touch An.
     try std.testing.expectEqual(Mnemonic.illegal, table[0x5208].mnemonic);
 

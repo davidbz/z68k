@@ -51,6 +51,12 @@ pub fn Core(comptime BusT: type) type {
             /// fault has a fixed one, so `faultVector` only reads this for
             /// `Fault.Trap`.
             trap_vector: Exception = .trap_0,
+            /// CHK's trap cost depends on which bound it tripped (`Dn > bound`
+            /// exits 2 cycles faster than `Dn < 0`); read back in `step` once
+            /// `enterException` has added the flat exception overhead, since
+            /// that overhead hasn't landed yet at the point CHK itself knows
+            /// which case applies.
+            chk_delta: u8 = 0,
             /// Set once a handler has passed a point where the group 0 frame's
             /// PC diverges from the pre-fault fallback. IR keeps the fallback
             /// value in every case here -- see the comment on `markPrefetch`.
@@ -357,6 +363,12 @@ pub fn Core(comptime BusT: type) type {
             dst.* = (dst.* & ~m) | (v & m);
         }
 
+        /// A `Dn`/`An`/immediate source never risks a fault: the read is
+        /// always a register access or the instruction stream itself.
+        fn noFaultSource(m: EaMode) bool {
+            return m == .data_reg or m == .addr_reg or m == .immediate;
+        }
+
         fn signExtend(v: u32, size: Size) u32 {
             return switch (size) {
                 .byte => @bitCast(@as(i32, @as(i8, @bitCast(@as(u8, @truncate(v)))))),
@@ -507,6 +519,7 @@ pub fn Core(comptime BusT: type) type {
                     else => {},
                 }
                 enterException(c, bus, faultVector(f, &ctx), ctx.fault);
+                if (f == Fault.Chk) c.cycles -= ctx.chk_delta;
                 return;
             };
 
@@ -585,14 +598,14 @@ pub fn Core(comptime BusT: type) type {
                 .jmp => try opJmp(ctx, op),
                 .move_from_sr => try opMoveFromSr(ctx, op),
                 .move_to_ccr => try opMoveToCcr(ctx, op),
-                .move_to_sr => try opMoveToSr(ctx, op),
-                .move_usp => try opMoveUsp(ctx, op),
+                .move_to_sr => try opMoveToSr(ctx, op, instr),
+                .move_usp => try opMoveUsp(ctx, op, instr),
                 .trap => try opTrap(ctx, op),
                 .trapv => try opTrapv(ctx),
                 .chk => try opChk(ctx, op),
-                .stop => try opStop(ctx),
-                .reset_insn => try opReset(ctx),
-                .rte => try opRte(ctx),
+                .stop => try opStop(ctx, instr),
+                .reset_insn => try opReset(ctx, instr),
+                .rte => try opRte(ctx, instr),
                 .rtr => try opRtr(ctx),
                 .movem => try opMovem(ctx, op, instr),
                 .tas => try opTas(ctx, op),
@@ -643,12 +656,20 @@ pub fn Core(comptime BusT: type) type {
 
             ctx.cpu.cycles += dst_mode.destCycles(size);
             {
+                const src_free = src_mode == .data_reg or src_mode == .addr_reg;
                 // Predecrement pays its full cost even when it faults; its
                 // first access is the one the destCycles discount covers.
-                errdefer if (size == .long and dst_mode != .addr_predec) {
-                    ctx.cpu.cycles -= 4;
+                // A long destination gives back a flat 4 regardless of EA
+                // kind, same shape as the source fault above. A word/byte
+                // destination only needs that same -4 for `abs_long`: its
+                // two extension words overlap the bus differently once the
+                // source read (anything but a free register) has already
+                // used it.
+                errdefer if (dst_mode != .addr_predec) {
+                    if (size == .long or (dst_mode == .abs_long and !src_free)) {
+                        ctx.cpu.cycles -= 4;
+                    }
                 };
-                const src_free = src_mode == .data_reg or src_mode == .addr_reg;
                 try writeEa(ctx, dst_mode, dst_reg, size, v, src_free);
             }
             if (!flags_first) ctx.cpu.sr.setNzvc(cc);
@@ -665,12 +686,24 @@ pub fn Core(comptime BusT: type) type {
 
             if (mn == .tst) {
                 ctx.cpu.cycles += mode.cycles(size);
+                // A faulting long read only ever got as far as its first
+                // word; give back the second word's cost it never paid for.
+                errdefer if (size == .long) {
+                    ctx.cpu.cycles -= 4;
+                };
                 const v = try readEa(ctx, mode, reg, size);
                 ctx.cpu.sr.setNzvc(flags.logic(v, size));
                 return;
             }
 
-            ctx.cpu.cycles += mode.destCycles(size);
+            // Charged as if this were the word-sized, register-destination
+            // form: a faulting read never reaches the long size's extra ALU
+            // cycles or a memory destination's write-back extra, both added
+            // below only once the read has actually succeeded.
+            ctx.cpu.cycles += mode.cycles(size);
+            errdefer if (size == .long) {
+                ctx.cpu.cycles -= 4;
+            };
             var addr: u32 = undefined;
             const old: u32 = if (mode == .data_reg)
                 ctx.cpu.d[reg] & size.mask()
@@ -707,6 +740,16 @@ pub fn Core(comptime BusT: type) type {
                 else => unreachable,
             };
 
+            // NBCD's decode-time base already bakes in its own (smaller,
+            // register-vs-memory) write-back cost; NEGX/CLR/NEG/NOT instead
+            // pay a flat 2 more for long's extra ALU pass plus a memory
+            // destination's write-back extra, once the read is known good.
+            if (mn != .nbcd) {
+                const alu_extra: u8 = if (size == .long) 2 else 0;
+                const rmw_extra: u8 = if (mode == .data_reg) 0 else if (size == .long) 6 else 4;
+                ctx.cpu.cycles += alu_extra + rmw_extra;
+            }
+
             if (mode == .data_reg) {
                 setReg(&ctx.cpu.d[reg], size, r.value);
             } else {
@@ -736,7 +779,13 @@ pub fn Core(comptime BusT: type) type {
                 return;
             }
 
-            ctx.cpu.cycles += mode.destCycles(size);
+            // Charged as the word-sized form; a faulting read never reaches
+            // the long/write-back bonus added below, once the read has
+            // actually succeeded (same shape as `opAlu2`'s RMW branch).
+            ctx.cpu.cycles += mode.cycles(size);
+            errdefer if (size == .long) {
+                ctx.cpu.cycles -= 4;
+            };
             var addr: u32 = undefined;
             const old: u32 = if (mode == .data_reg)
                 ctx.cpu.d[reg] & size.mask()
@@ -749,8 +798,10 @@ pub fn Core(comptime BusT: type) type {
             const result = (if (is_sub) old -% data else old +% data) & size.mask();
 
             if (mode == .data_reg) {
+                if (size == .long) ctx.cpu.cycles += 4;
                 setReg(&ctx.cpu.d[reg], size, result);
             } else {
+                ctx.cpu.cycles += if (size == .long) @as(u8, 8) else 4;
                 try writeAt(ctx, addr, size, result);
             }
             ctx.cpu.sr.setNzvcx(cc);
@@ -772,7 +823,10 @@ pub fn Core(comptime BusT: type) type {
                 if (true_cond) ctx.cpu.cycles += 2;
                 setReg(&ctx.cpu.d[reg], .byte, v);
             } else {
-                ctx.cpu.cycles += mode.destCycles(.byte);
+                // Full EA cost, not the predecrement-discounted `destCycles`:
+                // Scc's memory form is a plain write, not a read that
+                // computes its address ahead of the bus cycle.
+                ctx.cpu.cycles += mode.cycles(.byte);
                 const addr = try calcEa(ctx, mode, reg, .byte, false);
                 try writeAt(ctx, addr, .byte, v);
             }
@@ -856,8 +910,23 @@ pub fn Core(comptime BusT: type) type {
 
             if (!is_re) {
                 // Dn = Dn op ea (or, for CMP, just Dn - ea into the flags).
+                // Charged as the word-sized form; a faulting read never
+                // reaches long's extra ALU pass, added below only once the
+                // read has actually succeeded.
                 ctx.cpu.cycles += ea_mode.cycles(size);
+                errdefer if (size == .long) {
+                    ctx.cpu.cycles -= 4;
+                };
                 const src = try readEa(ctx, ea_mode, ea_reg, size);
+                if (size == .long) {
+                    // A register or immediate source never risks a fault, so
+                    // it takes the full register-destination long bonus (4,
+                    // or 2 for CMP, which never writes back); a real memory
+                    // read instead takes a flat 2, the rest of that bonus
+                    // already spent on the read itself.
+                    const no_fault = noFaultSource(ea_mode);
+                    ctx.cpu.cycles += if (no_fault) (if (mn == .cmp) @as(u8, 2) else 4) else 2;
+                }
                 const dst = ctx.cpu.d[dn] & size.mask();
 
                 switch (mn) {
@@ -883,8 +952,15 @@ pub fn Core(comptime BusT: type) type {
             }
 
             // ea = ea op Dn. Read-modify-write in shape only for a memory ea;
-            // EOR's ea may also be Dn, a plain register-register op.
-            ctx.cpu.cycles += ea_mode.destCycles(size);
+            // EOR's ea may also be Dn, a plain register-register op. Charged
+            // as the word-sized, register-destination form; a faulting read
+            // never reaches long's extra ALU pass or a memory destination's
+            // write-back extra, both added below only once the read has
+            // actually succeeded.
+            ctx.cpu.cycles += ea_mode.cycles(size);
+            errdefer if (size == .long) {
+                ctx.cpu.cycles -= 4;
+            };
             const src = ctx.cpu.d[dn] & size.mask();
             var addr: u32 = undefined;
             const old: u32 = if (ea_mode == .data_reg)
@@ -905,8 +981,13 @@ pub fn Core(comptime BusT: type) type {
             const r = aluCompute(kind, old, src, size);
 
             if (ea_mode == .data_reg) {
+                // EOR.l to Dn is a real hardware outlier: 4 extra, not the
+                // usual 2, since the register is read and written in the
+                // same cycle slot.
+                if (size == .long) ctx.cpu.cycles += if (mn == .eor) @as(u8, 4) else 2;
                 setReg(&ctx.cpu.d[ea_reg], size, r.value);
             } else {
+                ctx.cpu.cycles += if (size == .long) @as(u8, 8) else 4;
                 try writeAt(ctx, addr, size, r.value);
             }
             if (r.affects_x) ctx.cpu.sr.setNzvcx(r.cc) else ctx.cpu.sr.setNzvc(r.cc);
@@ -921,13 +1002,31 @@ pub fn Core(comptime BusT: type) type {
             const ea_mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
             const ea_reg: u3 = @truncate(op);
 
+            // Charged as the word-sized form; a faulting read never reaches
+            // the bonus added below once the read has actually succeeded.
             ctx.cpu.cycles += ea_mode.cycles(size);
+            errdefer if (size == .long) {
+                ctx.cpu.cycles -= 4;
+            };
             const src = signExtend(try readEa(ctx, ea_mode, ea_reg, size), size);
 
             switch (instr.mnemonic) {
-                .adda => ctx.cpu.a[an] +%= src,
-                .suba => ctx.cpu.a[an] -%= src,
-                .cmpa => ctx.cpu.sr.setNzvc(flags.sub(ctx.cpu.a[an], src, .long)),
+                .adda, .suba => {
+                    // Word ADDA/SUBA takes a flat +4 regardless of EA kind;
+                    // long instead takes +2 for a real memory read (folded
+                    // into its extra ALU pass) but +4 for a register or
+                    // immediate source (which never risked a fault at all).
+                    const no_fault = noFaultSource(ea_mode);
+                    ctx.cpu.cycles += if (size == .word or no_fault) @as(u8, 4) else 2;
+                    if (instr.mnemonic == .adda) ctx.cpu.a[an] +%= src else ctx.cpu.a[an] -%= src;
+                },
+                .cmpa => {
+                    // CMPA takes a flat +2, the same for every EA kind and
+                    // either size: it never writes back, so there's no
+                    // bigger register-destination bonus to fold in.
+                    ctx.cpu.cycles += 2;
+                    ctx.cpu.sr.setNzvc(flags.sub(ctx.cpu.a[an], src, .long));
+                },
                 else => unreachable,
             }
         }
@@ -941,7 +1040,12 @@ pub fn Core(comptime BusT: type) type {
             const ea_mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
             const ea_reg: u3 = @truncate(op);
             ctx.cpu.cycles += ea_mode.cycles(.word);
-            const src: u16 = @truncate(try readEa(ctx, ea_mode, ea_reg, .word));
+            // A faulting read gives back a flat 34, the same for every EA
+            // kind, once the automatic exception overhead lands.
+            const src: u16 = @truncate(readEa(ctx, ea_mode, ea_reg, .word) catch |e| {
+                ctx.cpu.cycles -= 34;
+                return e;
+            });
 
             const value: u32 = if (instr.mnemonic == .muls) blk: {
                 const s: i32 = @as(i16, @bitCast(src));
@@ -956,6 +1060,53 @@ pub fn Core(comptime BusT: type) type {
             ctx.cpu.sr.setNzvc(.{ .n = value & 0x8000_0000 != 0, .z = value == 0 });
         }
 
+        /// The real divider is a bit-serial non-restoring binary divider: 15
+        /// trial subtract/shift steps whose add-vs-subtract choice (based on
+        /// the running remainder's sign) each cost a data-dependent 0 or 2
+        /// extra cycles. `decode.Instr.base_cycles` can't express that, so
+        /// `opDiv` throws it away and computes the true total from scratch;
+        /// this reproduces Jorge Cwik's reverse-engineered algorithm.
+        fn divuCycles(dividend: u32, divisor: u32) u32 {
+            if (dividend >> 16 >= divisor) return 10;
+            var mcycles: u32 = 38;
+            const hdivisor = divisor << 16;
+            var dvd = dividend;
+            for (0..15) |_| {
+                const temp = dvd;
+                dvd <<= 1;
+                if (temp & 0x8000_0000 != 0) {
+                    dvd -%= hdivisor;
+                } else {
+                    mcycles += 2;
+                    if (dvd >= hdivisor) {
+                        dvd -%= hdivisor;
+                        mcycles -= 1;
+                    }
+                }
+            }
+            return mcycles * 2;
+        }
+
+        fn divsCycles(dividend: i32, divisor: i32) u32 {
+            var mcycles: u32 = 6;
+            if (dividend < 0) mcycles += 1;
+            const abs_dividend: u32 = @abs(dividend);
+            const abs_divisor: u32 = @abs(divisor);
+            if (abs_dividend >> 16 >= abs_divisor) return (mcycles + 2) * 2;
+
+            var aquot: u32 = abs_dividend / abs_divisor;
+            mcycles += 55;
+            if (divisor >= 0) {
+                if (dividend >= 0) mcycles -= 1 else mcycles += 1;
+            }
+            for (0..15) |_| {
+                const s16: i16 = @bitCast(@as(u16, @truncate(aquot)));
+                if (s16 >= 0) mcycles += 1;
+                aquot <<= 1;
+            }
+            return mcycles * 2;
+        }
+
         /// DIVU/DIVS: 32-bit Dn / 16-bit ea -> 16-bit quotient (low word),
         /// 16-bit remainder (high word), X unaffected. Overflow (quotient
         /// doesn't fit 16 bits) sets V, clears C, and leaves Dn untouched —
@@ -965,14 +1116,24 @@ pub fn Core(comptime BusT: type) type {
             const dn: u3 = @truncate(op >> 9);
             const ea_mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
             const ea_reg: u3 = @truncate(op);
+            // decode's base_cycles is just a placeholder (the real cost is
+            // fully data-dependent, computed below); throw it away.
+            ctx.cpu.cycles -= instr.base_cycles;
             ctx.cpu.cycles += ea_mode.cycles(.word);
-            const src: u16 = @truncate(try readEa(ctx, ea_mode, ea_reg, .word));
+            // A faulting read gives back a flat -4 (i.e. needs 4 added back),
+            // the same for every EA kind, once the automatic exception
+            // overhead lands.
+            const src: u16 = @truncate(readEa(ctx, ea_mode, ea_reg, .word) catch |e| {
+                ctx.cpu.cycles += 4;
+                return e;
+            });
             if (src == 0) return Fault.ZeroDivide;
 
             if (instr.mnemonic == .divu) {
                 const dividend = ctx.cpu.d[dn];
                 const divisor: u32 = src;
                 const quotient = dividend / divisor;
+                ctx.cpu.cycles += divuCycles(dividend, divisor);
                 if (quotient > 0xFFFF) {
                     ctx.cpu.sr.setNzvc(.{ .v = true, .n = true });
                     return;
@@ -983,6 +1144,7 @@ pub fn Core(comptime BusT: type) type {
             } else {
                 const dividend: i32 = @bitCast(ctx.cpu.d[dn]);
                 const divisor: i32 = @as(i16, @bitCast(src));
+                ctx.cpu.cycles += divsCycles(dividend, divisor);
                 const quotient = @divTrunc(dividend, divisor);
                 if (quotient > 32767 or quotient < -32768) {
                     ctx.cpu.sr.setNzvc(.{ .v = true, .n = true });
@@ -1014,7 +1176,13 @@ pub fn Core(comptime BusT: type) type {
                 .long => try fetch32(ctx),
             };
 
-            ctx.cpu.cycles += mode.destCycles(size);
+            // Charged word-sized either way; a faulting memory read never
+            // reaches long's extra ALU pass or a write-back extra, added
+            // below only once the read (if any) has actually succeeded.
+            ctx.cpu.cycles += mode.cycles(size);
+            errdefer if (size == .long) {
+                ctx.cpu.cycles -= 4;
+            };
             var addr: u32 = undefined;
             const old: u32 = if (mode == .data_reg)
                 ctx.cpu.d[reg] & size.mask()
@@ -1034,6 +1202,15 @@ pub fn Core(comptime BusT: type) type {
             };
             const r = aluCompute(kind, old, imm, size);
 
+            if (mode == .data_reg) {
+                // CMPI.l to Dn takes a smaller version of the usual long
+                // bonus: it reads but never writes, so there's no write-back
+                // extra to fold it into.
+                if (size == .long) ctx.cpu.cycles += if (mn == .cmpi) @as(u8, 2) else 4;
+            } else if (r.writes) {
+                ctx.cpu.cycles += if (size == .long) @as(u8, 8) else 4;
+            }
+
             if (r.writes) {
                 if (mode == .data_reg) {
                     setReg(&ctx.cpu.d[reg], size, r.value);
@@ -1050,7 +1227,10 @@ pub fn Core(comptime BusT: type) type {
         fn opImmediateSr(ctx: *Ctx, instr: decode.Instr) Fault!void {
             const mn = instr.mnemonic;
             switch (mn) {
-                .ori_sr, .andi_sr, .eori_sr => if (!ctx.cpu.sr.s) return Fault.PrivilegeViolation,
+                .ori_sr, .andi_sr, .eori_sr => if (!ctx.cpu.sr.s) {
+                    ctx.cpu.cycles -= instr.base_cycles;
+                    return Fault.PrivilegeViolation;
+                },
                 else => {},
             }
             const imm = try fetch16(ctx);
@@ -1120,19 +1300,43 @@ pub fn Core(comptime BusT: type) type {
                 // reason.
                 const src_addr = ctx.cpu.a[ry] -% stackAdjust(ry, size);
                 markPrefetch(ctx, ctx.cpu.pc, .addr_predec, false);
-                src = try predecLongRead(ctx, src_addr);
+                // `base_cycles` charges the full two-operand success total
+                // up front; a fault on the source read never reaches the
+                // destination access at all, so it must give back 20 of
+                // that (the destination's own would-have-been EA/access
+                // cost) once the flat exception overhead is added on top.
+                src = predecLongRead(ctx, src_addr) catch |e| {
+                    ctx.cpu.cycles -= 20;
+                    return e;
+                };
                 ctx.cpu.a[ry] = src_addr;
 
+                // Source already succeeded here, so only the smaller
+                // remainder (12) needs unwinding: the difference between
+                // "both operands" and "source operand" cost, not the whole
+                // destination-side share source-fault gives back above.
                 dst_addr = calcEa(ctx, .addr_predec, rx, size, true) catch |e| {
+                    ctx.cpu.cycles -= 12;
                     ctx.fault.?.read = true;
                     return e;
                 };
                 dst = try readAt(ctx, dst_addr, size, false);
             } else if (mem_form) {
                 const src_addr = try calcEa(ctx, .addr_predec, ry, size, false);
-                src = try readAt(ctx, src_addr, size, false);
+                // Byte accesses never fault (no alignment check), so these
+                // adjustments are no-ops for `.byte`; only `.word` can reach
+                // them. Same shape as the long case above: source-fault
+                // gives back more (8) than a fault after the source already
+                // succeeded (4).
+                src = readAt(ctx, src_addr, size, false) catch |e| {
+                    if (size == .word) ctx.cpu.cycles -= 8;
+                    return e;
+                };
                 dst_addr = try calcEa(ctx, .addr_predec, rx, size, true);
-                dst = try readAt(ctx, dst_addr, size, false);
+                dst = readAt(ctx, dst_addr, size, false) catch |e| {
+                    if (size == .word) ctx.cpu.cycles -= 4;
+                    return e;
+                };
             } else {
                 src = ctx.cpu.d[ry] & size.mask();
                 dst = ctx.cpu.d[rx] & size.mask();
@@ -1227,9 +1431,15 @@ pub fn Core(comptime BusT: type) type {
             const ax: u3 = @truncate(op >> 9);
             const ay: u3 = @truncate(op);
 
+            // Each (An)+ read can independently fault; charge its own EA
+            // cost here and unwind to the word-equivalent (-4 for long) only
+            // on that read's own fault, since a fault on the second read
+            // must leave the first (successful) read's full cost charged.
+            ctx.cpu.cycles += EaMode.addr_postinc.cycles(size);
             const src = if (size == .long) blk: {
                 const addr = ctx.cpu.a[ay];
                 if (addr & 1 != 0) {
+                    ctx.cpu.cycles -= 4;
                     ctx.cpu.a[ay] +%= 2;
                     // Same bus-timing quirk as ADDX/SUBX's long predecrement
                     // pair: this read's fault frame follows the write-side
@@ -1247,7 +1457,9 @@ pub fn Core(comptime BusT: type) type {
                 markPrefetch(ctx, ctx.cpu.pc, .addr_postinc, false);
                 break :blk try readAt(ctx, src_addr, size, false);
             };
+            ctx.cpu.cycles += EaMode.addr_postinc.cycles(size);
             const dst_addr = calcEa(ctx, .addr_postinc, ax, size, true) catch |e| {
+                if (size == .long) ctx.cpu.cycles -= 4;
                 ctx.fault.?.read = true;
                 return e;
             };
@@ -1282,9 +1494,16 @@ pub fn Core(comptime BusT: type) type {
             if (is_memory) {
                 const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
                 const reg: u3 = @truncate(op);
-                ctx.cpu.cycles += mode.destCycles(.word);
+                // Full EA cost, not the predecrement-discounted `destCycles`:
+                // the read and the write-back share one address, so a
+                // faulting read is the only fault point, and it always
+                // gives back a flat 4 once the exception overhead lands.
+                ctx.cpu.cycles += mode.cycles(.word);
                 const addr = try calcEa(ctx, mode, reg, .word, false);
-                const old = try readAt(ctx, addr, .word, false);
+                const old = readAt(ctx, addr, .word, false) catch |e| {
+                    ctx.cpu.cycles -= 4;
+                    return e;
+                };
                 const r = flags.shift(kind, old, 1, .word, x_in);
                 try writeAt(ctx, addr, .word, r.value);
                 ctx.cpu.sr.setNzvc(.{ .n = r.n, .z = r.z, .v = r.v, .c = r.c });
@@ -1470,7 +1689,12 @@ pub fn Core(comptime BusT: type) type {
             // `markPrefetch`), not a plain read's, despite reading An's
             // contents rather than writing anything.
             markPrefetch(ctx, ctx.cpu.pc, .addr_ind, false);
-            const v = try read32(ctx, sp, false);
+            // A faulting read gives back a flat 4 once the automatic
+            // exception overhead lands.
+            const v = read32(ctx, sp, false) catch |e| {
+                ctx.cpu.cycles -= 4;
+                return e;
+            };
             ctx.cpu.a[7] = sp +% 4;
             ctx.cpu.a[reg] = v;
         }
@@ -1488,7 +1712,14 @@ pub fn Core(comptime BusT: type) type {
             // mark uniformly rather than following its mode split.
             ctx.prefetch = .{ .ir = null, .pc = ctx.cpu.pc };
             const ret = ctx.cpu.pc;
-            try jump(ctx, addr);
+            // An odd target faults for the same total as JMP's own fault at
+            // that EA (nothing has been pushed yet to distinguish them), so
+            // JSR's extra base cost (the not-yet-attempted push) has to be
+            // given back here once the exception overhead lands.
+            jump(ctx, addr) catch |e| {
+                ctx.cpu.cycles -= 8;
+                return e;
+            };
             try push32(ctx, ret);
         }
 
@@ -1512,12 +1743,21 @@ pub fn Core(comptime BusT: type) type {
             if (mode == .data_reg) {
                 setReg(&ctx.cpu.d[reg], .word, v);
             } else {
-                ctx.cpu.cycles += mode.destCycles(.word);
+                // Full EA cost, not the predecrement-discounted `destCycles`:
+                // the dummy read below makes this destination behave like a
+                // read, not a plain write (same shape as `opMoveToCcr`).
+                ctx.cpu.cycles += mode.cycles(.word);
                 // `write=false`: the dummy read makes this destination
                 // behave like a read for postinc/predec's fault-vs-register
                 // ordering, matching the bus cycle that actually faults.
                 const addr = try calcEa(ctx, mode, reg, .word, false);
-                _ = try read16(ctx, addr, false);
+                // A faulting read gives back a flat 4, the same for every EA
+                // kind, once the automatic exception overhead lands (same
+                // shape as `opMoveToCcr`).
+                _ = read16(ctx, addr, false) catch |e| {
+                    ctx.cpu.cycles -= 4;
+                    return e;
+                };
                 try writeAt(ctx, addr, .word, v);
             }
         }
@@ -1526,28 +1766,48 @@ pub fn Core(comptime BusT: type) type {
             const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
             const reg: u3 = @truncate(op);
             ctx.cpu.cycles += mode.cycles(.word);
-            const v = try readEa(ctx, mode, reg, .word);
+            // A faulting read gives back a flat 8, the same for every EA
+            // kind, once the automatic exception overhead lands (same shape
+            // as `opMoveToSr`).
+            const v = readEa(ctx, mode, reg, .word) catch |e| {
+                ctx.cpu.cycles -= 8;
+                return e;
+            };
             const full = (ctx.cpu.sr.toInt() & 0xFF00) | (v & 0xFF);
             ctx.cpu.sr = cpu_mod.StatusRegister.fromInt(@truncate(full));
         }
 
         /// Privileged: a user-mode attempt faults before the source operand
-        /// is even read.
-        fn opMoveToSr(ctx: *Ctx, op: u16) Fault!void {
-            if (!ctx.cpu.sr.s) return Fault.PrivilegeViolation;
+        /// is even read, and before any of this instruction's own cost is
+        /// charged — dispatch's flat `base_cycles` add happens unconditionally
+        /// ahead of the handler, so a privilege violation has to give it back.
+        fn opMoveToSr(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            if (!ctx.cpu.sr.s) {
+                ctx.cpu.cycles -= instr.base_cycles;
+                return Fault.PrivilegeViolation;
+            }
             const mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
             const reg: u3 = @truncate(op);
             ctx.cpu.cycles += mode.cycles(.word);
-            const v = try readEa(ctx, mode, reg, .word);
+            // A faulting read gives back a flat 8, the same for every EA
+            // kind, once the automatic exception overhead lands.
+            const v = readEa(ctx, mode, reg, .word) catch |e| {
+                ctx.cpu.cycles -= 8;
+                return e;
+            };
             const new_sr = cpu_mod.StatusRegister.fromInt(@truncate(v));
             ctx.cpu.setSupervisor(new_sr.s);
             ctx.cpu.sr = new_sr;
         }
 
         /// MOVE USP: bit 3 of the opcode picks direction, since `Instr` has
-        /// no direction field (same convention as MOVEP).
-        fn opMoveUsp(ctx: *Ctx, op: u16) Fault!void {
-            if (!ctx.cpu.sr.s) return Fault.PrivilegeViolation;
+        /// no direction field (same convention as MOVEP). Same privilege-fault
+        /// cycle giveback as `opMoveToSr`.
+        fn opMoveUsp(ctx: *Ctx, op: u16, instr: decode.Instr) Fault!void {
+            if (!ctx.cpu.sr.s) {
+                ctx.cpu.cycles -= instr.base_cycles;
+                return Fault.PrivilegeViolation;
+            }
             const reg: u3 = @truncate(op);
             if (op & 0x0008 != 0) {
                 ctx.cpu.a[reg] = ctx.cpu.usp;
@@ -1579,10 +1839,34 @@ pub fn Core(comptime BusT: type) type {
             const ea_mode = EaMode.decode(@truncate(op >> 3), @truncate(op)).?;
             const ea_reg: u3 = @truncate(op);
             ctx.cpu.cycles += ea_mode.cycles(.word);
-            const bound: i16 = @bitCast(@as(u16, @truncate(try readEa(ctx, ea_mode, ea_reg, .word))));
+            // A faulting read gives back a flat 6, the same for every EA
+            // kind, once the automatic exception overhead lands.
+            const bound: i16 = @bitCast(@as(u16, @truncate(readEa(ctx, ea_mode, ea_reg, .word) catch |e| {
+                ctx.cpu.cycles -= 6;
+                return e;
+            })));
             const v: i16 = @bitCast(@as(u16, @truncate(ctx.cpu.d[dn])));
             ctx.cpu.sr.setNzvc(flags.logic(ctx.cpu.d[dn], .word));
-            if (v < 0 or v > bound) return Fault.Chk;
+            if (v < 0 or v > bound) {
+                // The trap itself is decided by the correct signed compare
+                // above, but its cost isn't: hardware re-derives "greater
+                // than" from a raw 16-bit `Dn - bound` ALU op and takes the
+                // fast exit whenever that raw subtract overflows OR comes
+                // out strictly positive — even when the *true* signed
+                // result disagrees (Dn very negative, bound very positive
+                // wraps the 16-bit subtract back to a false-positive
+                // "greater"). Every other combination takes the slow exit,
+                // 2 cycles more.
+                const dn_bits: u16 = @bitCast(v);
+                const bound_bits: u16 = @bitCast(bound);
+                const raw = dn_bits -% bound_bits;
+                const n = raw & 0x8000 != 0;
+                const z = raw == 0;
+                const overflow = (dn_bits ^ bound_bits) & 0x8000 != 0 and (dn_bits ^ raw) & 0x8000 != 0;
+                const fast = overflow or (!n and !z);
+                ctx.chk_delta = if (fast) 12 else 10;
+                return Fault.Chk;
+            }
         }
 
         /// STOP freezes the bus: no further prefetch happens, so unlike every
@@ -1591,8 +1875,11 @@ pub fn Core(comptime BusT: type) type {
         /// assumes prefetch resumes at the new PC, which here it never
         /// does). Rewinding by 4 undoes both this fetch and the opcode
         /// fetch `execute` already did, landing PC back on STOP itself.
-        fn opStop(ctx: *Ctx) Fault!void {
-            if (!ctx.cpu.sr.s) return Fault.PrivilegeViolation;
+        fn opStop(ctx: *Ctx, instr: decode.Instr) Fault!void {
+            if (!ctx.cpu.sr.s) {
+                ctx.cpu.cycles -= instr.base_cycles;
+                return Fault.PrivilegeViolation;
+            }
             const v = try fetch16(ctx);
             const new_sr = cpu_mod.StatusRegister.fromInt(v);
             ctx.cpu.setSupervisor(new_sr.s);
@@ -1605,8 +1892,11 @@ pub fn Core(comptime BusT: type) type {
         /// none to reset, so it is host-facing only: privileged, and costs
         /// cycles, but has no further effect (real hardware doesn't reset
         /// itself either).
-        fn opReset(ctx: *Ctx) Fault!void {
-            if (!ctx.cpu.sr.s) return Fault.PrivilegeViolation;
+        fn opReset(ctx: *Ctx, instr: decode.Instr) Fault!void {
+            if (!ctx.cpu.sr.s) {
+                ctx.cpu.cycles -= instr.base_cycles;
+                return Fault.PrivilegeViolation;
+            }
         }
 
         /// RTE: pops SR then PC (word then long, matching the frame `frame`
@@ -1615,8 +1905,11 @@ pub fn Core(comptime BusT: type) type {
         /// plain assignment, for the same reason RTS/JMP/JSR use it: the
         /// implied prefetch at the restored PC happens immediately, so an
         /// odd popped PC faults within this instruction, not the next.
-        fn opRte(ctx: *Ctx) Fault!void {
-            if (!ctx.cpu.sr.s) return Fault.PrivilegeViolation;
+        fn opRte(ctx: *Ctx, instr: decode.Instr) Fault!void {
+            if (!ctx.cpu.sr.s) {
+                ctx.cpu.cycles -= instr.base_cycles;
+                return Fault.PrivilegeViolation;
+            }
             const sr_word = try pop16(ctx);
             const pc = try pop32(ctx);
             const new_sr = cpu_mod.StatusRegister.fromInt(sr_word);
@@ -1681,6 +1974,14 @@ pub fn Core(comptime BusT: type) type {
             const predec = mode == .addr_predec;
             const postinc = mode == .addr_postinc;
             const orig_an = ctx.cpu.a[reg];
+
+            // A misaligned EA always faults on the very first register
+            // transfer attempted (stepping by an even amount never changes
+            // parity), so store's fault total is a flat 4 more than its
+            // base — load's already matches with no adjustment.
+            errdefer if (!load) {
+                ctx.cpu.cycles += 4;
+            };
 
             // Non-indexing modes compute the base address once; predec/postinc
             // instead step it once *per register* via `movemStep`, since each
