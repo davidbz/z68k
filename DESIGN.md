@@ -14,8 +14,9 @@ Sega Genesis emulator (separate repo). Toolchain: Zig 0.16.0.
 - **Accuracy target: architectural state + total cycle counts.** Registers,
   memory, SR, PC, and per-instruction cycle totals are validated against
   [SingleStepTests/m68000](https://github.com/SingleStepTests/m68000). The
-  prefetch queue and per-cycle bus transactions are *not* modeled — the Genesis
-  doesn't need them, and they roughly double the core's complexity.
+  prefetch queue and per-cycle bus *timing* are not modeled — the Genesis
+  doesn't need them, and they roughly double the core's complexity. Which
+  data-space bus cycles ran, in what order, is checked separately (§5.6).
 - **Comptime replaces codegen** (lesson from Musashi): Musashi generates its 64K
   opcode handlers with a build-time C program (`m68kmake`). Zig's `comptime`
   builds the same 65536-entry dispatch table from declarative pattern data at
@@ -247,7 +248,7 @@ pub const TestCase = struct {
     initial: State,
     final: State,
     length: u32,            // total cycles, from the transaction block header
-    // per-transaction bus activity: walked to find the next test, then dropped
+    accesses: []const Access, // the data-space bus cycles, in order (§5.6)
 };
 ```
 
@@ -478,6 +479,8 @@ Per test case:
    Nothing is masked or excused, including every word of an exception frame.
 5. Cycle check: `cpu.cycles == length` — reported as a **separate tier** so a
    regression says which kind it is.
+6. Bus check: the data-space cycles the core drove against the ones MAME
+   recorded — a third tier (§5.6).
 
 All 127 files run; nothing is excluded or skipped. `TAS` and `TRAPV` were
 excluded for a while on upstream's word (its README calls TAS's read-modify-write
@@ -487,15 +490,16 @@ its EA cost, and `opTrapv` charged a 4-cycle base on top of the trap's own 34.
 A filter argument (`zig build sst -- MOVE`) narrows the run by filename
 substring, nothing else.
 
-Reporting is two numbers per file plus the first state failure and the first
-cycle failure in each, with expected-vs-actual detail. The build gates on
-both tiers being complete: every case must match state *and* cycles, so any
-regression turns `zig build sst` red.
+Reporting is three numbers per file plus the first failure of each kind, with
+expected-vs-actual detail. The build gates on all three being complete: every
+case must match state, cycles *and* data-space bus cycles, so any regression
+turns `zig build sst` red.
 
 ### 5.3 CI
 
-- `zig build test` on every push (existing GitHub Actions).
-- SST harness as a manual/nightly workflow (test data is hundreds of MB).
+- `zig build test` and the full SST suite on every pull request
+  (`.github/workflows/ci.yml`). The ~2 GB fetch is done per run; the Zig build
+  cache is keyed on the `build.zig.zon` hash.
 
 ### 5.4 Group 0 fault frames
 
@@ -601,6 +605,50 @@ instruction-specific corrections to reach the cycle tier:
   when it faults, its first access being the one `destCycles`' discount covers
   — and at word size it *adds* 4 for the next-opcode prefetch that the same
   fault makes visible in IR (§5.4).
+
+### 5.6 Bus tier: which cycles ran, in what order
+
+Matching final state does not mean the right bus cycles happened. A read from
+the wrong address that happens to hold the right value, a write pair emitted
+back to front, a word access where the chip drives two bytes — all of them are
+invisible once the instruction has retired. The recorded transaction block
+already carries what is needed to see them, so the harness decodes it rather
+than skipping it.
+
+What is compared, per case: every **data-space** cycle, in order — address
+(even; the chip has no A0), direction, the two data strobes, and the driven
+half or halves of the data bus. What is not:
+
+- **Program space.** Prefetches, PC-relative operand reads, and the harness's
+  own opcode re-read for the fault frame. No prefetch queue is modelled
+  (§1), so this core's program cycles legitimately differ. The core tells the
+  bus which space each access is in through an optional `setProgram` hook —
+  `if (@hasDecl(BusT, "setProgram"))`, so the documented four-function contract
+  (§3.7) is unchanged for hosts that don't want it. Exception **vector fetches
+  are supervisor data**, not program, which is why `enterException` reads them
+  with `program = false`.
+- **Per-transaction timing.** Idle cycles and each transaction's duration are
+  dropped; only the total feeds the cycle tier.
+- **Address-error cycles** (upstream kinds 4 and 5), where AS is never asserted
+  and no bus cycle happens.
+- **The undriven half of the data bus.** A byte write mirrors the byte onto
+  both halves on hardware; only the strobed lane is meaningful.
+
+The tier gates like the other two: 317,500 of 317,500. It started at 227,669
+and every gap was a real divergence, not an over-strict comparison. What it
+found, and what the fixes settled:
+
+| Class | What the data showed | Where |
+|---|---|---|
+| **Byte reads through `d(PC)`** | Reported as data space because `read8` had no space parameter. Seven byte families, ~60 cases each. | `read8` |
+| **Frame push order** | The microcode does not push a frame in stack order. It writes the low word of each stacked long, then an unrelated word, then the high word: PC low, SR, PC high for the 3-word frame, and the same interleave twice over for the 7-word one. Worth 76,420 cases on its own. | `frame` |
+| **Long word order** | Not one rule. A plain `MOVE.l` to memory, a stack push (JSR/BSR/PEA/LINK) and every ordinary long read go **high word first**. Read-modify-write write-back, `MOVE.l`/`MOVEM.l` to `-(An)`, and both `ADDX.l`/`SUBX.l -(An)` operand reads go **low word first**. Derived per family from the recordings — a blanket swap looked plausible and broke the state tier, because read order decides which half commits before an address error. | `write32Low`/`read32Low` and their callers |
+| **MOVEM's trailing read** | Loading registers runs one word read past the end of the list and discards it; the flat `base_cycles` already paid for it, so only the bus saw it missing. | `opMovem` |
+| **Missing RMW read** | `Scc` with a memory destination wrote without reading first. Same shape as the `MOVEfromSR` note in §5.5, which cycle counts caught instead. | `opScc` |
+
+The word-order split is the one to remember: order is state-visible on reads
+(a fault mid-long leaves the already-read half committed) and invisible on
+writes (both halves are aligned by then, or the operand read faulted first).
 
 ## 6. References
 
