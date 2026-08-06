@@ -3,6 +3,7 @@
 //!     tools/fetch_tests.sh          # once, clones the test data into testdata/
 //!     zig build sst                 # run everything
 //!     zig build sst -- MOVE         # only files whose name contains MOVE
+//!     zig build sst -- --coverage   # plus an opcode census of what ran
 //!
 //! Reads the upstream `.json.bin` files directly rather than going through
 //! their `decode.py`: the container is a simple tagged binary format, so
@@ -35,6 +36,14 @@ const even_bus_addr_mask = 0xFF_FFFE;
 const max_ram_words = 256;
 /// Same reasoning, for bus cycles rather than distinct words.
 const max_accesses = 256;
+
+/// Opcode census (`--coverage`): which of the 65,536 encodings the suite
+/// actually reached. 2500 sampled cases per family prove nothing about
+/// coverage of the decode table, and this is the cheapest way to ask. A bit
+/// per encoding is 8 KiB of always-present state, so the flag needs no
+/// allocation and costs a bit-set per case when it is on.
+var census = false;
+var executed = std.StaticBitSet(1 << 16).initEmpty();
 
 // ---------------------------------------------------------------- binary format
 
@@ -538,6 +547,11 @@ fn runFile(src: []const u8, ram: []u8, name: []const u8) !Tally {
         var c: Cpu = undefined;
         load(&tc.initial, &c, &bus);
 
+        if (census) {
+            const at = c.pc & even_bus_addr_mask;
+            executed.set(std.mem.readInt(u16, bus.ram[at..][0..2], .big));
+        }
+
         Core.step(&c, &bus);
 
         tally.total += 1;
@@ -568,7 +582,10 @@ pub fn main(init: std.process.Init) !void {
 
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip();
-    const filter = args.next();
+    var filter: ?[]const u8 = null;
+    while (args.next()) |a| {
+        if (std.mem.eql(u8, a, "--coverage")) census = true else filter = a;
+    }
 
     var dir = std.Io.Dir.cwd().openDir(io, test_dir, .{ .iterate = true }) catch |err| {
         std.debug.print(
@@ -628,7 +645,28 @@ pub fn main(init: std.process.Init) !void {
         total.cycles_ok, total.total,
         total.bus_ok,    total.total,
     });
+    if (census) reportCensus();
     if (!total.clean()) return error.ConformanceFailed;
+}
+
+/// How much of the decode table the run actually executed, by mnemonic. Only
+/// families with holes are listed — a full one has nothing to say. `illegal`
+/// covers every unassigned encoding, so it is never expected to be complete.
+fn reportCensus() void {
+    const fields = @typeInfo(m68k.decode.Mnemonic).@"enum".fields;
+    var seen = [_]u32{0} ** fields.len;
+    var total = [_]u32{0} ** fields.len;
+    for (0..1 << 16) |op| {
+        const i = @intFromEnum(m68k.decode.table[op].mnemonic);
+        total[i] += 1;
+        if (executed.isSet(op)) seen[i] += 1;
+    }
+
+    std.debug.print("\nopcode census: {d} of 65536 encodings executed\n", .{executed.count()});
+    inline for (fields) |f| {
+        if (seen[f.value] < total[f.value])
+            std.debug.print("  {s:<10} {d:>5} of {d:>5}\n", .{ f.name, seen[f.value], total[f.value] });
+    }
 }
 
 // ------------------------------------------------------------------------ tests

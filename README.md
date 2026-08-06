@@ -50,6 +50,7 @@ The test data (~2 GB) is fetched once into `testdata/` (gitignored):
 tools/fetch_tests.sh
 zig build sst              # run everything
 zig build sst -- MOVE      # only files whose name contains "MOVE"
+zig build sst -- --coverage  # plus an opcode census of what actually ran
 ```
 
 The suite gates on three tiers per file — `state` (full architectural match),

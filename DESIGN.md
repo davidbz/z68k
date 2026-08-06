@@ -652,6 +652,26 @@ The word-order split is the one to remember: order is state-visible on reads
 (a fault mid-long leaves the already-read half committed) and invisible on
 writes (both halves are aligned by then, or the operand read faulted first).
 
+### 5.7 Opcode census
+
+`zig build sst -- --coverage` sets a bit per executed encoding and prints, by
+mnemonic, which families the suite left holes in. 2500 sampled cases per file
+is a lot of cases but says nothing about how much of the 65,536-entry decode
+table they reach; this answers it directly.
+
+The full suite executes **41,766 of 65,536 encodings**. The gaps worth knowing:
+
+- **`illegal`: 0 of 10,935.** Upstream never tests an unassigned encoding
+  outside lines A and F. Every one of them takes the same path (vector 4), and
+  `core.zig`'s unit tests cover it, but nothing exhaustive does.
+- **`illegal_insn`: 0 of 1.** The dedicated `ILLEGAL` opcode (0x4AFC) is not in
+  `ILLEGAL.json.bin` either — that file is entirely line A / line F.
+- **`line_a`/`line_f`: ~46% each**, and the shift/rotate families ~91%. Sampled
+  encodings, nothing structural.
+
+Everything else is a sampling artefact of the same kind: no family is missing a
+*mode*, only individual register/displacement encodings of one.
+
 ## 6. References
 
 - [SingleStepTests/m68000](https://github.com/SingleStepTests/m68000) — MAME-generated per-opcode JSON conformance tests
