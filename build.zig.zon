@@ -1,6 +1,6 @@
 .{
     .name = .z68k,
-    .version = "0.0.0",
+    .version = "0.0.1",
     .fingerprint = 0xc8df02eddbc88817,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
@@ -9,6 +9,7 @@
         "build.zig.zon",
         "src",
         "tools",
+        "examples",
         "DESIGN.md",
         "LICENSE",
         "README.md",
